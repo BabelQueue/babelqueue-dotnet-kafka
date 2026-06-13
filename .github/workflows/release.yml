@@ -21,7 +21,7 @@ jobs:
         run: dotnet test -c Release
 
       - name: Pack
-        run: dotnet pack src/BabelQueue.Pulsar/BabelQueue.Pulsar.csproj -c Release -o artifacts
+        run: dotnet pack src/BabelQueue.Kafka/BabelQueue.Kafka.csproj -c Release -o artifacts
 
       - name: Publish to NuGet
         run: >
