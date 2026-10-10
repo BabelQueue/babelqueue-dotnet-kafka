@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-10
+
 ### Fixed
 - `KafkaConsumer` now checks the `bq-schema-version` header (UTF-8) **before** decoding the record (§6.7). A value other than exactly `"1"` (ordinal, untrimmed) is forwarded raw to `<topic>.dlq` and committed without decoding, the same path as an undecodable record (a no-op forward when no DLQ topic is configured, so the record is just committed). A header with a null value counts as absent. Absent or blank (empty / ASCII whitespace) falls through to the normal decode. No public API change.
 - The schema-version gate no longer loses a record when the DLQ write fails: `KafkaConsumer` now `Seek`s back to the failed record's offset (so a later record's cumulative commit cannot skip it), does not commit it, reports via `OnError` and backs off for one `PollTimeout`; the record never reaches a handler. `OnError` is invoked **after** the commit / seek-back and isolated, so a throwing callback cannot bypass the protection. If the seek itself fails a `BabelQueueException` wrapping both errors is thrown. Other DLQ paths (poison body, exhausted retries, unknown URN) are unchanged. No public API change.
