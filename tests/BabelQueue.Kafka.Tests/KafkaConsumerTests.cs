@@ -129,6 +129,29 @@ public sealed class KafkaConsumerTests
     }
 
     [Fact]
+    public async Task RawDlqPreservesSourceKey()
+    {
+        var key = Encoding.UTF8.GetBytes("customer-42");
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var result = new ConsumeResult<byte[], byte[]>
+        {
+            Topic = "orders",
+            Partition = new Partition(0),
+            Offset = new Offset(4),
+            Message = new Message<byte[], byte[]> { Key = key, Value = Encoding.UTF8.GetBytes("not-json"), Headers = new Headers() },
+        };
+
+        await new KafkaConsumer(ConsumerWith(result).Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+        }).PollAsync();
+
+        Assert.Equal("orders.dlq", captured[0].Topic);
+        Assert.Equal(key, captured[0].Message.Key);
+    }
+
+    [Fact]
     public async Task RetryWithoutTopicsOrDlqRaises()
     {
         var handlers = new Dictionary<string, BabelHandler>

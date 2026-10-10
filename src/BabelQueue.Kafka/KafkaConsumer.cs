@@ -299,6 +299,7 @@ public sealed class KafkaConsumer
         RequireProducer();
         var message = new Message<byte[], byte[]>
         {
+            Key = result.Message.Key,
             Value = result.Message.Value,
             Headers = result.Message.Headers,
             Timestamp = new Timestamp(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), TimestampType.CreateTime),

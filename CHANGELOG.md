@@ -9,6 +9,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- `KafkaConsumer` now preserves the source record's key on the raw forward to `<topic>.dlq` (poison body / schema-version gate), matching the Java and Node transports. Previously the key was dropped, so DLQ partition assignment and key-based triage diverged from the source topic. The annotated `dead_letter` envelope and retry-tier republish are unchanged (parity with Java/Node). No public API change; wire envelope and header names are unchanged.
+
 ## [1.0.1] - 2026-10-10
 
 ### Fixed
