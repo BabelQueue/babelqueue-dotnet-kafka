@@ -71,7 +71,7 @@ await worker.RunAsync(cancellationToken); // consume → process → commit
 
 A throwing handler republishes the envelope to the next `<topic>.retry.<n>` tier with
 `bq-attempts + 1`, then commits; once `MaxTries` is reached it goes to `<topic>.dlq` with a
-`dead_letter` block. Before decoding, the consumer reads the `bq-schema-version` header (UTF-8): absent or blank decodes as usual, any other value must be exactly `"1"`, otherwise the raw record is forwarded to `<topic>.dlq` and committed without being decoded (with no DLQ topic configured the forward is a no-op, so the record is just committed — it degrades to delete). A header with a null value counts as absent. The consumer routes on the `bq-job` header. Unknown-URN strategy is one
+`dead_letter` block. Before decoding, the consumer reads the `bq-schema-version` header (UTF-8): absent or blank decodes as usual, any other value must be exactly `"1"`, otherwise the raw record is forwarded to `<topic>.dlq` and committed without being decoded (with no DLQ topic configured the forward is a no-op, so the record is just committed — it degrades to delete). If the DLQ write itself fails, the record is **not** committed: the consumer seeks back to its offset (so a later record's cumulative commit cannot skip it), reports via `OnError` (after the seek; a throwing `OnError` cannot bypass it), backs off for one `PollTimeout` and the loop keeps running. A header with a null value counts as absent. The consumer routes on the `bq-job` header. Unknown-URN strategy is one
 of `fail` / `delete` / `release` / `dead_letter`.
 
 ## Contract mapping (§6)

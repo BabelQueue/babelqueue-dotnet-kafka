@@ -288,6 +288,131 @@ public sealed class KafkaConsumerTests
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
     }
 
+    [Theory]
+    [InlineData("2")]
+    [InlineData("x")]
+    public async Task SchemaVersionGateDlqFailureSeeksBackAndDoesNotCommitOrRunHandler(string version)
+    {
+        var result = ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), version);
+        var consumer = ConsumerWith(result);
+        var producer = new Mock<IProducer<byte[], byte[]>>();
+        producer
+            .Setup(p => p.ProduceAsync(It.IsAny<string>(), It.IsAny<Message<byte[], byte[]>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ProduceException<byte[], byte[]>(new Error(ErrorCode.TopicAuthorizationFailed), new DeliveryResult<byte[], byte[]>()));
+        var reported = new List<Exception>();
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        var count = await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = producer.Object,
+            RetryTopics = Topology(),
+            PollTimeout = TimeSpan.FromMilliseconds(1),
+            OnError = (e, _, _) => reported.Add(e),
+        }).PollAsync();
+
+        Assert.Equal(1, count);
+        Assert.Equal(0, calls);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+        consumer.Verify(
+            c => c.Seek(It.Is<TopicPartitionOffset>(t => t.Topic == "orders" && t.Partition.Value == 0 && t.Offset.Value == 9)),
+            Times.Once);
+        Assert.Equal(2, reported.Count);
+        Assert.IsType<ProduceException<byte[], byte[]>>(reported[1].InnerException);
+    }
+
+    [Fact]
+    public async Task SchemaVersionGateThrowingOnErrorStillCommitsAfterSuccessfulDeadLetter()
+    {
+        var result = ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), "2");
+        var consumer = ConsumerWith(result);
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        var count = await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            OnError = (_, _, _) => throw new InvalidOperationException("observer exploded"),
+        }).PollAsync();
+
+        Assert.Equal(1, count);
+        Assert.Equal(0, calls);
+        Assert.Single(captured);
+        consumer.Verify(c => c.Commit(result), Times.Once);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SchemaVersionGateThrowingOnErrorStillSeeksBackAfterDeadLetterFailure()
+    {
+        var result = ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), "2");
+        var consumer = ConsumerWith(result);
+        var producer = new Mock<IProducer<byte[], byte[]>>();
+        producer
+            .Setup(p => p.ProduceAsync(It.IsAny<string>(), It.IsAny<Message<byte[], byte[]>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ProduceException<byte[], byte[]>(new Error(ErrorCode.TopicAuthorizationFailed), new DeliveryResult<byte[], byte[]>()));
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        var count = await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = producer.Object,
+            RetryTopics = Topology(),
+            PollTimeout = TimeSpan.FromMilliseconds(1),
+            OnError = (_, _, _) => throw new InvalidOperationException("observer exploded"),
+        }).PollAsync();
+
+        Assert.Equal(1, count);
+        Assert.Equal(0, calls);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+        consumer.Verify(
+            c => c.Seek(It.Is<TopicPartitionOffset>(t => t.Topic == "orders" && t.Partition.Value == 0 && t.Offset.Value == 9)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task SchemaVersionGateSeekFailureSurfacesBothErrorsAndDoesNotCommit()
+    {
+        var result = ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), "2");
+        var consumer = ConsumerWith(result);
+        consumer.Setup(c => c.Seek(It.IsAny<TopicPartitionOffset>())).Throws(new InvalidOperationException("seek failed"));
+        var producer = new Mock<IProducer<byte[], byte[]>>();
+        producer
+            .Setup(p => p.ProduceAsync(It.IsAny<string>(), It.IsAny<Message<byte[], byte[]>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ProduceException<byte[], byte[]>(new Error(ErrorCode.TopicAuthorizationFailed), new DeliveryResult<byte[], byte[]>()));
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        var consumerUnderTest = new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = producer.Object,
+            RetryTopics = Topology(),
+            PollTimeout = TimeSpan.FromMilliseconds(1),
+        });
+
+        var error = await Assert.ThrowsAsync<BabelQueueException>(() => consumerUnderTest.PollAsync());
+
+        var inner = Assert.IsType<AggregateException>(error.InnerException);
+        Assert.IsType<ProduceException<byte[], byte[]>>(inner.InnerExceptions[0]);
+        Assert.IsType<InvalidOperationException>(inner.InnerExceptions[1]);
+        Assert.Equal(0, calls);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+    }
+
     [Fact]
     public async Task NullValuedSchemaVersionHeaderIsTreatedAsAbsent()
     {

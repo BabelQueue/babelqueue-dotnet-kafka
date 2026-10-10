@@ -14,7 +14,9 @@ namespace BabelQueue.Kafka;
 /// native delivery count, so the <c>bq-attempts</c> header is the authoritative counter (the
 /// body's <c>attempts</c> is the fallback for non-BabelQueue records). Before decoding, the
 /// <c>bq-schema-version</c> header is checked (§6.7): an absent or blank header decodes normally, any
-/// value other than <c>"1"</c> sends the raw record to the DLQ without decoding it, then commits.
+/// value other than <c>"1"</c> sends the raw record to the DLQ without decoding it, then commits. If that DLQ
+/// write fails the record is <b>not</b> committed: the consumer seeks back to its offset (so a later record's
+/// cumulative commit cannot skip it), reports via <see cref="KafkaConsumerOptions.OnError"/> and the loop continues.
 /// </summary>
 public sealed class KafkaConsumer
 {
@@ -77,16 +79,29 @@ public sealed class KafkaConsumer
                 EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
                 StringComparison.Ordinal))
         {
-            // The body is deliberately not decoded, so hand OnError an empty envelope. The raw record
-            // goes to the DLQ (same path as a poison body) and the offset is committed.
-            _options.OnError?.Invoke(
-                new BabelQueueException(
-                    $"Rejected a Kafka record: unsupported {KafkaHeaders.SchemaVersion} header '{declaredVersion}' "
-                    + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
-                new Envelope(null, null, null, null, 0, null),
-                result);
-            await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
+            // The body is deliberately not decoded, so OnError gets an empty envelope. The raw record goes
+            // to the DLQ (same path as a poison body) and the offset is committed. Settle FIRST, report
+            // afterwards: a throwing OnError must never bypass the commit / seek-back (it is isolated below).
+            var rejected = new BabelQueueException(
+                $"Rejected a Kafka record: unsupported {KafkaHeaders.SchemaVersion} header '{declaredVersion}' "
+                + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded.");
+            try
+            {
+                await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
+            }
+#pragma warning disable CA1031 // A failed DLQ write must rewind the record, whatever the cause.
+            catch (Exception dlqError) when (dlqError is not OperationCanceledException)
+#pragma warning restore CA1031
+            {
+                // The gated record could not be parked. Do NOT commit: Consume() already advanced the
+                // in-memory position, and a later record's cumulative commit would skip this one. Seek back
+                // to its offset so the next poll redelivers it (it never reaches a handler: the gate rejects
+                // it again), report, and back off for one poll interval so a persistent failure doesn't spin.
+                await RewindAfterDeadLetterFailureAsync(result, rejected, dlqError, cancellationToken).ConfigureAwait(false);
+                return;
+            }
             Commit(result);
+            SafeReport(rejected, EmptyEnvelope(), result);
             return;
         }
 
@@ -121,6 +136,62 @@ public sealed class KafkaConsumer
             _options.OnError?.Invoke(error, envelope, result);
             await RetryOrDeadLetterAsync(result, envelope, error, cancellationToken).ConfigureAwait(false);
             Commit(result);
+        }
+    }
+
+    private async Task RewindAfterDeadLetterFailureAsync(
+        ConsumeResult<byte[], byte[]> result, Exception rejected, Exception dlqError, CancellationToken cancellationToken)
+    {
+        try
+        {
+            _consumer.Seek(result.TopicPartitionOffset);
+        }
+#pragma warning disable CA1031 // Surface the seek failure together with the original DLQ failure.
+        catch (Exception seekError)
+#pragma warning restore CA1031
+        {
+            throw new BabelQueueException(
+                $"Kafka seek back to {result.Topic}[{result.Partition.Value}]@{result.Offset.Value} failed after a "
+                + "dead-letter write failure; the unsettled record may be skipped by a later commit on this partition.",
+                new AggregateException(dlqError, seekError));
+        }
+
+        // The rewind is done; only now run the (isolated) callbacks.
+        SafeReport(rejected, EmptyEnvelope(), result);
+        SafeReport(
+            new BabelQueueException(
+                $"Failed to dead-letter a schema-version-gated Kafka record {result.Topic}[{result.Partition.Value}]"
+                + $"@{result.Offset.Value}; rewound for redelivery, not committed.",
+                dlqError),
+            EmptyEnvelope(),
+            result);
+        try
+        {
+            await Task.Delay(_options.PollTimeout, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down: the rewind already happened, nothing to commit.
+        }
+    }
+
+    private static Envelope EmptyEnvelope() => new(null, null, null, null, 0, null);
+
+    /// <summary>
+    /// Invokes <see cref="KafkaConsumerOptions.OnError"/> on the schema-version-gate path, where it must not be
+    /// able to disturb settlement: a throwing callback is swallowed (there is no safer sink than the consumer
+    /// itself) so the already-performed commit / seek-back stands and the loop keeps running.
+    /// </summary>
+    private void SafeReport(Exception error, Envelope envelope, ConsumeResult<byte[], byte[]> result)
+    {
+        try
+        {
+            _options.OnError?.Invoke(error, envelope, result);
+        }
+#pragma warning disable CA1031 // A misbehaving observer must not bypass the gate's commit / seek-back.
+        catch (Exception)
+#pragma warning restore CA1031
+        {
         }
     }
 
