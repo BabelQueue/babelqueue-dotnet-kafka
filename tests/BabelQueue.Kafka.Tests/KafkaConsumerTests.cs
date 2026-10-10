@@ -436,6 +436,171 @@ public sealed class KafkaConsumerTests
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
     }
 
+    // ---- restart / redelivery: an unsettled record must never be skipped by a later commit ----
+
+    /// <summary>
+    /// A two-record partition log behind a mocked <see cref="IConsumer{TKey,TValue}"/> that models Kafka's
+    /// cumulative per-partition semantics: <c>Consume</c> advances the in-memory position, <c>Seek</c> rewinds
+    /// it and <c>Commit</c> stores offset + 1. A "restart" resets the position to the committed offset.
+    /// </summary>
+    private sealed class PartitionLog
+    {
+        private readonly List<ConsumeResult<byte[], byte[]>> _records;
+
+        public PartitionLog(params ConsumeResult<byte[], byte[]>[] records)
+        {
+            _records = new List<ConsumeResult<byte[], byte[]>>(records);
+            Mock.Setup(c => c.Consume(It.IsAny<TimeSpan>())).Returns(() =>
+                Position < _records.Count ? _records[Position++] : null);
+            Mock.Setup(c => c.Seek(It.IsAny<TopicPartitionOffset>())).Callback<TopicPartitionOffset>(t =>
+                Position = _records.FindIndex(r => r.Offset == t.Offset));
+            Mock.Setup(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()))
+                .Callback<ConsumeResult<byte[], byte[]>>(r => Committed = (int)r.Offset.Value + 1);
+        }
+
+        public Mock<IConsumer<byte[], byte[]>> Mock { get; } = new();
+
+        public int Position { get; private set; }
+
+        /// <summary>Index of the first record a restarted consumer would receive.</summary>
+        public int Committed { get; private set; }
+
+        public void Restart() => Position = Committed;
+    }
+
+    private static ConsumeResult<byte[], byte[]> Record(long offset, string body) => new()
+    {
+        Topic = "orders",
+        Partition = new Partition(0),
+        Offset = new Offset(offset),
+        Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes(body), Headers = new Headers() },
+    };
+
+    private static Mock<IProducer<byte[], byte[]>> FailingProducer()
+    {
+        var producer = new Mock<IProducer<byte[], byte[]>>();
+        producer
+            .Setup(p => p.ProduceAsync(It.IsAny<string>(), It.IsAny<Message<byte[], byte[]>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ProduceException<byte[], byte[]>(new Error(ErrorCode.TopicAuthorizationFailed), new DeliveryResult<byte[], byte[]>()));
+        return producer;
+    }
+
+    [Fact]
+    public async Task PoisonDlqFailureSeeksBackSoARestartedLoopRedeliversTheSameRecord()
+    {
+        var log = new PartitionLog(Record(0, "not-json"), Record(1, EnvelopeCodec.Encode(Envelope(0))));
+        var handled = 0;
+        var handlers = new Dictionary<string, BabelHandler> { [Urn] = (_, _, _) => { handled++; return Task.CompletedTask; } };
+        var options = new KafkaConsumerOptions { Producer = FailingProducer().Object, RetryTopics = Topology() };
+
+        await Assert.ThrowsAsync<ProduceException<byte[], byte[]>>(
+            () => new KafkaConsumer(log.Mock.Object, handlers, options).PollAsync());
+
+        // Restarting the loop on the same consumer must hand out the poison record again, not record 1.
+        Assert.Equal(0, log.Position);
+        Assert.Equal(0, log.Committed);
+        log.Mock.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+
+        // Once the DLQ recovers the poison record is parked and only then the stream moves on.
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var recovered = new KafkaConsumer(log.Mock.Object, handlers,
+            new KafkaConsumerOptions { Producer = Producer(captured).Object, RetryTopics = Topology() });
+        await recovered.PollAsync();
+        await recovered.PollAsync();
+        Assert.Equal("orders.dlq", Assert.Single(captured).Topic);
+        Assert.Equal(1, handled);
+        Assert.Equal(2, log.Committed);
+    }
+
+    [Fact]
+    public async Task HandlerRetryRepublishFailureSeeksBackAndDoesNotLetTheNextCommitSkipTheRecord()
+    {
+        var log = new PartitionLog(Record(0, EnvelopeCodec.Encode(Envelope(0))), Record(1, EnvelopeCodec.Encode(Envelope(0))));
+        var attempts = new List<int>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { attempts.Add(attempts.Count); return attempts.Count == 1 ? throw new InvalidOperationException("boom") : Task.CompletedTask; },
+        };
+
+        await Assert.ThrowsAsync<ProduceException<byte[], byte[]>>(() =>
+            new KafkaConsumer(log.Mock.Object, handlers,
+                new KafkaConsumerOptions { Producer = FailingProducer().Object, RetryTopics = Topology() }).PollAsync());
+
+        Assert.Equal(0, log.Position);
+        Assert.Equal(0, log.Committed);
+
+        // The crashed loop is restarted: the same record is processed again before anything is committed.
+        log.Restart();
+        var restarted = new KafkaConsumer(log.Mock.Object, handlers);
+        await restarted.PollAsync();
+        Assert.Equal(2, attempts.Count);
+        Assert.Equal(1, log.Committed);
+    }
+
+    [Fact]
+    public async Task UnknownUrnFailSeeksBackSoTheRecordRedeliversOnTheNextPoll()
+    {
+        var log = new PartitionLog(Record(0, EnvelopeCodec.Encode(Envelope(0))));
+        var worker = new KafkaConsumer(log.Mock.Object, new Dictionary<string, BabelHandler>());
+
+        await Assert.ThrowsAsync<UnknownUrnException>(() => worker.PollAsync());
+
+        Assert.Equal(0, log.Position);
+        log.Mock.Verify(c => c.Seek(It.Is<TopicPartitionOffset>(t => t.Offset.Value == 0)), Times.Once);
+        log.Mock.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task UnknownUrnDeadLetterFailureSeeksBackAndDoesNotCommit()
+    {
+        var log = new PartitionLog(Record(0, EnvelopeCodec.Encode(Envelope(0))));
+        var worker = new KafkaConsumer(log.Mock.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = FailingProducer().Object,
+            RetryTopics = Topology(),
+            UnknownUrn = UnknownUrnStrategy.DeadLetter,
+        });
+
+        await Assert.ThrowsAsync<ProduceException<byte[], byte[]>>(() => worker.PollAsync());
+
+        Assert.Equal(0, log.Position);
+        Assert.Equal(0, log.Committed);
+        log.Mock.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SettlementFailureWithFailingSeekSurfacesBothErrorsAndDoesNotCommit()
+    {
+        var log = new PartitionLog(Record(0, "not-json"));
+        log.Mock.Setup(c => c.Seek(It.IsAny<TopicPartitionOffset>())).Throws(new InvalidOperationException("seek failed"));
+        var worker = new KafkaConsumer(log.Mock.Object, new Dictionary<string, BabelHandler>(),
+            new KafkaConsumerOptions { Producer = FailingProducer().Object, RetryTopics = Topology() });
+
+        var error = await Assert.ThrowsAsync<BabelQueueException>(() => worker.PollAsync());
+
+        var inner = Assert.IsType<AggregateException>(error.InnerException);
+        Assert.IsType<ProduceException<byte[], byte[]>>(inner.InnerExceptions[0]);
+        Assert.IsType<InvalidOperationException>(inner.InnerExceptions[1]);
+        log.Mock.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CancellationDuringSettlementSeeksBackInsteadOfLeavingThePositionAdvanced()
+    {
+        var log = new PartitionLog(Record(0, "not-json"));
+        var producer = new Mock<IProducer<byte[], byte[]>>();
+        producer
+            .Setup(p => p.ProduceAsync(It.IsAny<string>(), It.IsAny<Message<byte[], byte[]>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new OperationCanceledException());
+        var worker = new KafkaConsumer(log.Mock.Object, new Dictionary<string, BabelHandler>(),
+            new KafkaConsumerOptions { Producer = producer.Object, RetryTopics = Topology() });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker.PollAsync());
+
+        Assert.Equal(0, log.Position);
+        log.Mock.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+    }
+
     [Fact]
     public async Task NullValuedSchemaVersionHeaderIsTreatedAsAbsent()
     {

@@ -17,12 +17,25 @@ namespace BabelQueue.Kafka;
 /// value other than <c>"1"</c> sends the raw record to the DLQ without decoding it, then commits. If that DLQ
 /// write fails the record is <b>not</b> committed: the consumer seeks back to its offset (so a later record's
 /// cumulative commit cannot skip it), reports via <see cref="KafkaConsumerOptions.OnError"/> and the loop continues.
+/// <para>
+/// Any <b>other</b> failure that escapes <see cref="PollAsync"/> (a failed poison / retry / DLQ write, an unmapped
+/// URN under <c>fail</c>, a cancellation mid-settlement) also leaves the record uncommitted <b>and seeks the consumer
+/// back to its offset</b> before the exception is rethrown. <c>Consume</c> has already advanced the in-memory position,
+/// and Kafka's commit is a cumulative per-partition position, so without the seek a caller that catches the
+/// exception and polls again (or restarts <see cref="RunAsync"/>) would receive the next record, and committing
+/// it would skip the unsettled one for good. With the seek, the next poll redelivers the same record. This relies
+/// on <c>EnableAutoCommit = false</c> (see the README): an auto-committing consumer stores the offset itself.
+/// </para>
 /// </summary>
 public sealed class KafkaConsumer
 {
     private readonly IConsumer<byte[], byte[]> _consumer;
     private readonly IReadOnlyDictionary<string, BabelHandler> _handlers;
     private readonly KafkaConsumerOptions _options;
+
+    // Set when a seek-back has been attempted for the record being handled, so the PollAsync safety net does
+    // not seek (or wrap a seek failure) a second time. The consumer is single-threaded, like IConsumer itself.
+    private bool _seekBackAttempted;
 
     public KafkaConsumer(
         IConsumer<byte[], byte[]> consumer,
@@ -44,7 +57,20 @@ public sealed class KafkaConsumer
         {
             return 0;
         }
-        await HandleAsync(result, cancellationToken).ConfigureAwait(false);
+        _seekBackAttempted = false;
+        try
+        {
+            await HandleAsync(result, cancellationToken).ConfigureAwait(false);
+        }
+#pragma warning disable CA1031 // Any settlement failure must rewind the unsettled record, whatever the cause.
+        catch (Exception error) when (!_seekBackAttempted)
+#pragma warning restore CA1031
+        {
+            // The record was neither committed nor parked: rewind so a restarted loop resumes at THIS offset
+            // instead of at the next record (whose cumulative commit would silently skip it).
+            SeekBack(result, error);
+            throw;
+        }
         return 1;
     }
 
@@ -142,19 +168,7 @@ public sealed class KafkaConsumer
     private async Task RewindAfterDeadLetterFailureAsync(
         ConsumeResult<byte[], byte[]> result, Exception rejected, Exception dlqError, CancellationToken cancellationToken)
     {
-        try
-        {
-            _consumer.Seek(result.TopicPartitionOffset);
-        }
-#pragma warning disable CA1031 // Surface the seek failure together with the original DLQ failure.
-        catch (Exception seekError)
-#pragma warning restore CA1031
-        {
-            throw new BabelQueueException(
-                $"Kafka seek back to {result.Topic}[{result.Partition.Value}]@{result.Offset.Value} failed after a "
-                + "dead-letter write failure; the unsettled record may be skipped by a later commit on this partition.",
-                new AggregateException(dlqError, seekError));
-        }
+        SeekBack(result, dlqError);
 
         // The rewind is done; only now run the (isolated) callbacks.
         SafeReport(rejected, EmptyEnvelope(), result);
@@ -172,6 +186,29 @@ public sealed class KafkaConsumer
         catch (OperationCanceledException)
         {
             // Shutting down: the rewind already happened, nothing to commit.
+        }
+    }
+
+    /// <summary>
+    /// Seeks the consumer back to <paramref name="result"/>'s own offset (nothing was committed for it).
+    /// If the seek itself fails, throws a <see cref="BabelQueueException"/> carrying both the original
+    /// <paramref name="cause"/> and the seek error, naming the record so it can be recovered by hand.
+    /// </summary>
+    private void SeekBack(ConsumeResult<byte[], byte[]> result, Exception cause)
+    {
+        _seekBackAttempted = true;
+        try
+        {
+            _consumer.Seek(result.TopicPartitionOffset);
+        }
+#pragma warning disable CA1031 // Surface the seek failure together with the original failure.
+        catch (Exception seekError)
+#pragma warning restore CA1031
+        {
+            throw new BabelQueueException(
+                $"Kafka seek back to {result.Topic}[{result.Partition.Value}]@{result.Offset.Value} failed after a "
+                + "settlement failure; the unsettled record may be skipped by a later commit on this partition.",
+                new AggregateException(cause, seekError));
         }
     }
 
@@ -236,7 +273,7 @@ public sealed class KafkaConsumer
                 Commit(result);
                 return;
             default:
-                // Fail: surface and do NOT commit — the record redelivers on the next poll.
+                // Fail: surface and do NOT commit — PollAsync seeks back, so the record redelivers on the next poll.
                 _options.OnError?.Invoke(new UnknownUrnException(urn), envelope, result);
                 throw new UnknownUrnException(urn);
         }
