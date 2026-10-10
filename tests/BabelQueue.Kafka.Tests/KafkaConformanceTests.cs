@@ -100,7 +100,8 @@ public sealed class KafkaConformanceTests
             var headers = new Headers();
             if (!absent)
             {
-                headers.Add(property, Encoding.UTF8.GetBytes(value!));
+                // JSON null: the header is present with a null value, which §6.7 treats as absent.
+                headers.Add(property, value is null ? null : Encoding.UTF8.GetBytes(value));
             }
 
             var result = new ConsumeResult<byte[], byte[]>
