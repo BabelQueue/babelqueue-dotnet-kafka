@@ -213,6 +213,99 @@ public sealed class KafkaConsumerTests
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
     }
 
+    private static ConsumeResult<byte[], byte[]> ResultWithSchemaVersion(string body, string? version)
+    {
+        var headers = new Headers();
+        if (version is not null)
+        {
+            headers.Add(KafkaHeaders.SchemaVersion, Encoding.UTF8.GetBytes(version));
+        }
+
+        return new ConsumeResult<byte[], byte[]>
+        {
+            Topic = "orders",
+            Partition = new Partition(0),
+            Offset = new Offset(9),
+            Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes(body), Headers = headers },
+        };
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" \t")]
+    [InlineData("1")]
+    public async Task AbsentBlankOrCurrentSchemaVersionHeaderDecodesAndRunsHandler(string? version)
+    {
+        var consumer = ConsumerWith(ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), version));
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers).PollAsync();
+
+        Assert.Equal(1, calls);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData("2")]
+    [InlineData("x")]
+    [InlineData(" 1")]
+    public async Task UnsupportedSchemaVersionHeaderIsRejectedWithoutDecoding(string version)
+    {
+        // The body is not valid JSON, but the decoder does not throw on it (it yields an empty envelope that
+        // the Accepts() branch would also send to the DLQ with the same settle). The two paths differ only in
+        // the OnError message, which is what proves the header gate fired before the decoder ran.
+        const string body = "{ this is not json";
+        var result = ResultWithSchemaVersion(body, version);
+        var consumer = ConsumerWith(result);
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        Exception? reported = null;
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            OnError = (e, _, _) => reported = e,
+        }).PollAsync();
+
+        Assert.Equal(0, calls);
+        Assert.NotNull(reported);
+        Assert.Contains(KafkaHeaders.SchemaVersion, reported!.Message);
+        Assert.Contains($"'{version}'", reported.Message);
+        Assert.DoesNotContain("non-conformant", reported.Message);
+        var dlq = Assert.Single(captured);
+        Assert.Equal("orders.dlq", dlq.Topic);
+        Assert.Equal(body, Encoding.UTF8.GetString(dlq.Message.Value));
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task NullValuedSchemaVersionHeaderIsTreatedAsAbsent()
+    {
+        var result = ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), null);
+        result.Message.Headers.Add(KafkaHeaders.SchemaVersion, null);
+        var consumer = ConsumerWith(result);
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers).PollAsync();
+
+        Assert.Equal(1, calls);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
     [Fact]
     public async Task PollReturnsZeroOnTimeout()
     {

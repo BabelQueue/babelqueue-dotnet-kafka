@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -77,6 +78,73 @@ public sealed class KafkaConformanceTests
             await new KafkaConsumer(consumer.Object, handlers).PollAsync();
 
             Assert.Equal(expected, seen);
+        }
+    }
+
+    [Fact]
+    public async Task SchemaVersionGateMatchesGolden()
+    {
+        var gate = Kafka().GetProperty("schema_version_gate");
+        var property = gate.GetProperty("property").GetString()!;
+        var body = File.ReadAllText(Path.Combine(Dir, gate.GetProperty("fixture").GetString()!));
+        var job = EnvelopeCodec.Decode(body).Job!;
+
+        var cases = gate.GetProperty("cases").EnumerateArray().ToList();
+        Assert.NotEmpty(cases);
+        foreach (var testCase in cases)
+        {
+            var absent = testCase.TryGetProperty("absent", out var a) && a.GetBoolean();
+            var value = absent ? null : testCase.GetProperty("value").GetString();
+            var expect = testCase.GetProperty("expect").GetString();
+
+            var headers = new Headers();
+            if (!absent)
+            {
+                headers.Add(property, Encoding.UTF8.GetBytes(value!));
+            }
+
+            var result = new ConsumeResult<byte[], byte[]>
+            {
+                Topic = "orders",
+                Partition = new Partition(0),
+                Offset = new Offset(0),
+                Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes(body), Headers = headers },
+            };
+            var consumer = new Mock<IConsumer<byte[], byte[]>>();
+            consumer.Setup(c => c.Consume(It.IsAny<TimeSpan>())).Returns(result);
+
+            var captured = new List<string>();
+            var producer = new Mock<IProducer<byte[], byte[]>>();
+            producer
+                .Setup(p => p.ProduceAsync(It.IsAny<string>(), It.IsAny<Message<byte[], byte[]>>(), It.IsAny<CancellationToken>()))
+                .Callback<string, Message<byte[], byte[]>, CancellationToken>((t, _, _) => captured.Add(t))
+                .ReturnsAsync(new DeliveryResult<byte[], byte[]>());
+
+            var seen = 0;
+            var handlers = new Dictionary<string, BabelHandler>
+            {
+                [job] = (_, _, _) => { seen++; return Task.CompletedTask; },
+            };
+            await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+            {
+                Producer = producer.Object,
+                RetryTopics = RetryTopics.ForTopic("orders").Tier(TimeSpan.FromSeconds(5)).Build(),
+            }).PollAsync();
+
+            var label = absent ? "<absent>" : $"'{value}'";
+            Assert.True(
+                (expect == "decode" ? 1 : 0) == seen,
+                $"{label}: expected {expect} but handler ran {seen} time(s)");
+            if (expect == "decode")
+            {
+                Assert.Empty(captured);
+            }
+            else
+            {
+                Assert.Equal(new[] { "orders.dlq" }, captured);
+            }
+
+            consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
         }
     }
 }

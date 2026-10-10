@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Confluent.Kafka;
 
@@ -11,7 +12,9 @@ namespace BabelQueue.Kafka;
 /// <c>bq-attempts + 1</c> (the SDK-owned retry, §6.5), then commits; once max-tries is reached the
 /// envelope goes to <c>&lt;topic&gt;.dlq</c> with a <c>dead_letter</c> block. Kafka exposes no
 /// native delivery count, so the <c>bq-attempts</c> header is the authoritative counter (the
-/// body's <c>attempts</c> is the fallback for non-BabelQueue records).
+/// body's <c>attempts</c> is the fallback for non-BabelQueue records). Before decoding, the
+/// <c>bq-schema-version</c> header is checked (§6.7): an absent or blank header decodes normally, any
+/// value other than <c>"1"</c> sends the raw record to the DLQ without decoding it, then commits.
 /// </summary>
 public sealed class KafkaConsumer
 {
@@ -52,9 +55,41 @@ public sealed class KafkaConsumer
         }
     }
 
+    /// <summary>
+    /// The <c>bq-schema-version</c> header as UTF-8, or null when it is absent <b>or carries a null value</b>
+    /// (Kafka allows null header values; a null value counts as "absent" and falls through to the decode path).
+    /// </summary>
+    private static string? ReadSchemaVersionHeader(Headers? headers)
+        => headers is not null && headers.TryGetLastBytes(KafkaHeaders.SchemaVersion, out var bytes) && bytes is not null
+            ? Encoding.UTF8.GetString(bytes)
+            : null;
+
     private async Task HandleAsync(ConsumeResult<byte[], byte[]> result, CancellationToken cancellationToken)
     {
         var headers = result.Message.Headers;
+
+        // §6.7: version-gate on the bq-schema-version header before decoding the body. The value is
+        // compared exactly as sent (no trimming), like the Pulsar/Go/Python/Node consumers (GR-5).
+        var declaredVersion = ReadSchemaVersionHeader(headers);
+        if (declaredVersion is not null && !IsBlankSchemaVersion(declaredVersion)
+            && !string.Equals(
+                declaredVersion,
+                EnvelopeCodec.SchemaVersion.ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal))
+        {
+            // The body is deliberately not decoded, so hand OnError an empty envelope. The raw record
+            // goes to the DLQ (same path as a poison body) and the offset is committed.
+            _options.OnError?.Invoke(
+                new BabelQueueException(
+                    $"Rejected a Kafka record: unsupported {KafkaHeaders.SchemaVersion} header '{declaredVersion}' "
+                    + $"(supported: {EnvelopeCodec.SchemaVersion}); body not decoded."),
+                new Envelope(null, null, null, null, 0, null),
+                result);
+            await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
+            Commit(result);
+            return;
+        }
+
         var envelope = Reconcile(EnvelopeCodec.Decode(Value(result)), headers);
 
         if (!EnvelopeCodec.Accepts(envelope))
@@ -87,6 +122,24 @@ public sealed class KafkaConsumer
             await RetryOrDeadLetterAsync(result, envelope, error, cancellationToken).ConfigureAwait(false);
             Commit(result);
         }
+    }
+
+    /// <summary>
+    /// True when the declared schema version is empty or consists <b>only</b> of ASCII whitespace
+    /// (space, <c>\t</c>, <c>\n</c>, U+000B, <c>\f</c>, <c>\r</c>). Anything else (NBSP, U+0085, U+FEFF, …)
+    /// is <b>not</b> blank, unlike <see cref="string.IsNullOrWhiteSpace"/>.
+    /// </summary>
+    private static bool IsBlankSchemaVersion(string value)
+    {
+        foreach (var c in value)
+        {
+            if (c != ' ' && (c < '\t' || c > '\r'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary><c>bq-attempts</c> header is authoritative; the body <c>Attempts</c> is the fallback.</summary>
