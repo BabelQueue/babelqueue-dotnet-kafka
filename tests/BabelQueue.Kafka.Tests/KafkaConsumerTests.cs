@@ -236,6 +236,193 @@ public sealed class KafkaConsumerTests
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
     }
 
+    [Fact]
+    public async Task NonConformantEnvelopeWithThrowingOnErrorStillParksAndCommits()
+    {
+        var result = new ConsumeResult<byte[], byte[]>
+        {
+            Topic = "orders",
+            Partition = new Partition(0),
+            Offset = new Offset(4),
+            Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes("not-json"), Headers = new Headers() },
+        };
+        var consumer = ConsumerWith(result);
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+
+        await new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            OnError = (_, _, _) => throw new InvalidOperationException("sink down"),
+        }).PollAsync();
+
+        Assert.Equal("orders.dlq", Assert.Single(captured).Topic);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task NonConformantEnvelopeDlqFailureWithThrowingOnErrorStillSeeksBackAndDoesNotCommit()
+    {
+        var result = new ConsumeResult<byte[], byte[]>
+        {
+            Topic = "orders",
+            Partition = new Partition(0),
+            Offset = new Offset(4),
+            Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes("not-json"), Headers = new Headers() },
+        };
+        var consumer = ConsumerWith(result);
+        var producer = new Mock<IProducer<byte[], byte[]>>();
+        producer
+            .Setup(p => p.ProduceAsync(It.IsAny<string>(), It.IsAny<Message<byte[], byte[]>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("broker down"));
+        var worker = new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = producer.Object,
+            RetryTopics = Topology(),
+            OnError = (_, _, _) => throw new InvalidOperationException("sink down"),
+        });
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => worker.PollAsync());
+
+        Assert.Equal("broker down", thrown.Message);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ThrowingHandlerWithThrowingOnErrorStillRepublishesToRetryAndCommits()
+    {
+        var consumer = ConsumerWith(ResultFor(Envelope(0)));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            MaxTries = 3,
+            OnError = (_, _, _) => throw new InvalidOperationException("sink down"),
+        }).PollAsync();
+
+        Assert.Equal("orders.retry.1", Assert.Single(captured).Topic);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ExhaustedHandlerWithThrowingOnErrorStillDeadLettersAndCommits()
+    {
+        var consumer = ConsumerWith(ResultFor(Envelope(2)));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            MaxTries = 3,
+            OnError = (_, _, _) => throw new InvalidOperationException("sink down"),
+        }).PollAsync();
+
+        Assert.Equal("orders.dlq", Assert.Single(captured).Topic);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task HandlerFailureWhoseCommitFailsStillReportsTheHandlerErrorAfterSeekingBack()
+    {
+        var consumer = ConsumerWith(ResultFor(Envelope(0)));
+        var order = new List<string>();
+        consumer.Setup(c => c.Seek(It.IsAny<TopicPartitionOffset>())).Callback(() => order.Add("seek"));
+        consumer.Setup(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()))
+            .Throws(new InvalidOperationException("commit down"));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+        var reported = new List<Exception>();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => new KafkaConsumer(
+            consumer.Object,
+            handlers,
+            new KafkaConsumerOptions
+            {
+                Producer = Producer(captured).Object,
+                RetryTopics = Topology(),
+                MaxTries = 3,
+                OnError = (e, _, _) =>
+                {
+                    order.Add("report");
+                    reported.Add(e);
+                },
+            }).PollAsync());
+
+        Assert.Equal("commit down", thrown.Message);
+        Assert.Equal("boom", Assert.Single(reported).Message);
+        Assert.Equal(new[] { "seek", "report" }, order);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task NonConformantEnvelopeWhoseCommitFailsStillReportsTheRejectionAfterSeekingBack()
+    {
+        var result = new ConsumeResult<byte[], byte[]>
+        {
+            Topic = "orders",
+            Partition = new Partition(0),
+            Offset = new Offset(4),
+            Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes("not-json"), Headers = new Headers() },
+        };
+        var consumer = ConsumerWith(result);
+        var order = new List<string>();
+        consumer.Setup(c => c.Seek(It.IsAny<TopicPartitionOffset>())).Callback(() => order.Add("seek"));
+        consumer.Setup(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()))
+            .Throws(new InvalidOperationException("commit down"));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var reported = new List<Exception>();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => new KafkaConsumer(
+            consumer.Object,
+            new Dictionary<string, BabelHandler>(),
+            new KafkaConsumerOptions
+            {
+                Producer = Producer(captured).Object,
+                RetryTopics = Topology(),
+                OnError = (e, _, _) =>
+                {
+                    order.Add("report");
+                    reported.Add(e);
+                },
+            }).PollAsync());
+
+        Assert.Equal("commit down", thrown.Message);
+        Assert.IsType<BabelQueueException>(Assert.Single(reported));
+        Assert.Equal(new[] { "seek", "report" }, order);
+    }
+
+    [Fact]
+    public async Task UnknownUrnFailWithThrowingOnErrorStillRaisesUnknownUrnAndSeeksBack()
+    {
+        var consumer = ConsumerWith(ResultFor(Envelope(0)));
+        var worker = new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            OnError = (_, _, _) => throw new InvalidOperationException("sink down"),
+        });
+
+        await Assert.ThrowsAsync<UnknownUrnException>(() => worker.PollAsync());
+
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Once);
+    }
+
     /// <summary>A structurally valid envelope whose <c>data</c> string carries a lone 0xFF byte (invalid UTF-8).</summary>
     private static byte[] EnvelopeBytesWithInvalidUtf8()
     {

@@ -9,6 +9,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- `KafkaConsumer` no longer lets a throwing `OnError` callback bypass settlement on the non-conformant-envelope and handler-failure paths. Previously `OnError` ran *before* the raw DLQ write + commit (non-conformant envelope) and before the retry republish / DLQ write + commit (handler failure); a throwing callback skipped the settlement and the record was redelivered forever. Both paths now settle first and report afterwards through the isolated `SafeReport` (as the schema-version gate and invalid-UTF-8 paths already did), and the unknown-URN `Fail` path reports through it too, so the intended `UnknownUrnException` still surfaces. If settlement itself fails (DLQ / retry write or the commit), the record is sought back first and `OnError` is then still reported (isolated) with the original error. No public API change; wire envelope, `dead_letter` shape and header names are unchanged.
+
 ## [1.0.3] - 2026-10-11
 
 ### Fixed

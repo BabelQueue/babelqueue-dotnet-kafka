@@ -154,10 +154,22 @@ public sealed class KafkaConsumer
         if (!EnvelopeCodec.Accepts(envelope))
         {
             // A non-conformant / poison record: forward the raw bytes to the DLQ for triage.
-            _options.OnError?.Invoke(
-                new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Kafka."), envelope, result);
-            await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
-            Commit(result);
+            // Settle FIRST, report afterwards (as on the schema-version gate): a throwing OnError must never
+            // bypass the DLQ write / commit, or the record would be redelivered and fail forever.
+            var rejected = new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Kafka.");
+            try
+            {
+                await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
+                Commit(result);
+            }
+#pragma warning disable CA1031 // Seek back, then report the rejection, whatever the settlement failure was.
+            catch (Exception settleError)
+#pragma warning restore CA1031
+            {
+                SeekBackThenReport(result, settleError, rejected, envelope);
+                throw;
+            }
+            SafeReport(rejected, envelope, result);
             return;
         }
 
@@ -177,9 +189,21 @@ public sealed class KafkaConsumer
         catch (Exception error)
 #pragma warning restore CA1031
         {
-            _options.OnError?.Invoke(error, envelope, result);
-            await RetryOrDeadLetterAsync(result, envelope, error, cancellationToken).ConfigureAwait(false);
-            Commit(result);
+            // Settle FIRST (retry republish / DLQ), report afterwards: a throwing OnError must never bypass
+            // the settlement, or the record would be redelivered to the failing handler forever.
+            try
+            {
+                await RetryOrDeadLetterAsync(result, envelope, error, cancellationToken).ConfigureAwait(false);
+                Commit(result);
+            }
+#pragma warning disable CA1031 // Seek back, then report the handler failure, whatever the settlement failure was.
+            catch (Exception settleError)
+#pragma warning restore CA1031
+            {
+                SeekBackThenReport(result, settleError, error, envelope);
+                throw;
+            }
+            SafeReport(error, envelope, result);
         }
     }
 
@@ -230,13 +254,31 @@ public sealed class KafkaConsumer
         }
     }
 
+    /// <summary>
+    /// Settlement failed (the DLQ / retry write or the commit): rewind the record first, then hand the original
+    /// <paramref name="reported"/> error to <see cref="KafkaConsumerOptions.OnError"/>. The report runs even when the
+    /// seek itself fails, and the caller rethrows the settlement failure (or this method throws the seek failure).
+    /// </summary>
+    private void SeekBackThenReport(
+        ConsumeResult<byte[], byte[]> result, Exception settleError, Exception reported, Envelope envelope)
+    {
+        try
+        {
+            SeekBack(result, settleError);
+        }
+        finally
+        {
+            SafeReport(reported, envelope, result);
+        }
+    }
+
     private static Envelope EmptyEnvelope() => new(null, null, null, null, 0, null);
 
     /// <summary>
-    /// Invokes <see cref="KafkaConsumerOptions.OnError"/> on the raw-DLQ paths (schema-version gate, invalid UTF-8
-    /// body), where it must not be able to disturb settlement: a throwing callback is swallowed (there is no
-    /// safer sink than the consumer itself) so the already-performed commit / seek-back stands and the loop
-    /// keeps running.
+    /// Invokes <see cref="KafkaConsumerOptions.OnError"/> on every settlement path (schema-version gate, invalid
+    /// UTF-8 body, non-conformant envelope, handler failure, unknown URN), where it must not be able to disturb
+    /// settlement: a throwing callback is swallowed (there is no safer sink than the consumer itself) so the
+    /// already-performed commit / seek-back stands and the loop keeps running.
     /// </summary>
     private void SafeReport(Exception error, Envelope envelope, ConsumeResult<byte[], byte[]> result)
     {
@@ -293,7 +335,7 @@ public sealed class KafkaConsumer
                 return;
             default:
                 // Fail: surface and do NOT commit — PollAsync seeks back, so the record redelivers on the next poll.
-                _options.OnError?.Invoke(new UnknownUrnException(urn), envelope, result);
+                SafeReport(new UnknownUrnException(urn), envelope, result);
                 throw new UnknownUrnException(urn);
         }
     }
