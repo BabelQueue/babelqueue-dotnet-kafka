@@ -236,6 +236,112 @@ public sealed class KafkaConsumerTests
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
     }
 
+    /// <summary>A structurally valid envelope whose <c>data</c> string carries a lone 0xFF byte (invalid UTF-8).</summary>
+    private static byte[] EnvelopeBytesWithInvalidUtf8()
+    {
+        var json = EnvelopeCodec.Encode(Envelope(0));
+        var bytes = Encoding.UTF8.GetBytes(json.Replace("\"order_id\":7", "\"order_id\":\"@@\""));
+        var at = Array.IndexOf(bytes, (byte)'@');
+        Assert.True(at >= 0, "marker not found in encoded envelope");
+        var invalid = new byte[bytes.Length - 1];
+        Array.Copy(bytes, 0, invalid, 0, at);
+        invalid[at] = 0xFF;
+        Array.Copy(bytes, at + 2, invalid, at + 1, bytes.Length - at - 2);
+        return invalid;
+    }
+
+    private static ConsumeResult<byte[], byte[]> ResultWithBody(byte[] body, long offset = 6) => new()
+    {
+        Topic = "orders",
+        Partition = new Partition(0),
+        Offset = new Offset(offset),
+        Message = new Message<byte[], byte[]> { Key = Encoding.UTF8.GetBytes("k1"), Value = body, Headers = new Headers() },
+    };
+
+    [Fact]
+    public async Task InvalidUtf8BodyIsForwardedRawToDlqNotDecodedWithReplacementChars()
+    {
+        var body = EnvelopeBytesWithInvalidUtf8();
+        Assert.Contains((byte)0xFF, body);
+        var consumer = ConsumerWith(ResultWithBody(body));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        Exception? reported = null;
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            OnError = (e, _, _) => reported = e,
+        }).PollAsync();
+
+        Assert.Equal(0, calls);
+        Assert.IsType<BabelQueueException>(reported);
+        var dlq = Assert.Single(captured);
+        Assert.Equal("orders.dlq", dlq.Topic);
+        Assert.Equal(body, dlq.Message.Value); // original bytes, byte for byte
+        Assert.Equal(Encoding.UTF8.GetBytes("k1"), dlq.Message.Key);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task InvalidUtf8BodyWithThrowingOnErrorStillParksAndCommits()
+    {
+        var consumer = ConsumerWith(ResultWithBody(EnvelopeBytesWithInvalidUtf8()));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+
+        await new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            OnError = (_, _, _) => throw new InvalidOperationException("sink down"),
+        }).PollAsync();
+
+        Assert.Equal("orders.dlq", Assert.Single(captured).Topic);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task InvalidUtf8BodyDlqFailureDoesNotCommitAndSeeksBack()
+    {
+        var consumer = ConsumerWith(ResultWithBody(EnvelopeBytesWithInvalidUtf8(), 6));
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        await Assert.ThrowsAsync<ProduceException<byte[], byte[]>>(() =>
+            new KafkaConsumer(consumer.Object, handlers,
+                new KafkaConsumerOptions { Producer = FailingProducer().Object, RetryTopics = Topology() }).PollAsync());
+
+        Assert.Equal(0, calls);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+        consumer.Verify(
+            c => c.Seek(It.Is<TopicPartitionOffset>(t => t.Topic == "orders" && t.Offset.Value == 6)), Times.Once);
+    }
+
+    [Fact]
+    public async Task InvalidUtf8BodyWithoutDlqTopicIsJustCommitted()
+    {
+        var consumer = ConsumerWith(ResultWithBody(EnvelopeBytesWithInvalidUtf8()));
+        var calls = 0;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => { calls++; return Task.CompletedTask; },
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers).PollAsync();
+
+        Assert.Equal(0, calls);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
     private static ConsumeResult<byte[], byte[]> ResultWithSchemaVersion(string body, string? version)
     {
         var headers = new Headers();

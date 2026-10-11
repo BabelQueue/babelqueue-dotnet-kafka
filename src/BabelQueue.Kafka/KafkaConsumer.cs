@@ -131,7 +131,25 @@ public sealed class KafkaConsumer
             return;
         }
 
-        var envelope = Reconcile(EnvelopeCodec.Decode(Value(result)), headers);
+        var body = StrictBody(result);
+        if (body is null)
+        {
+            // Invalid UTF-8: a lenient decoder would silently swap the bad bytes for U+FFFD and hand a corrupted
+            // payload to a handler. Treat it as poison instead (parity with the Java/Go/Node consumers): the
+            // ORIGINAL bytes go raw to the DLQ and the offset is committed. A failed DLQ write throws out of
+            // here and PollAsync seeks back without committing, like every other poison record.
+            // Settle FIRST, report afterwards (as on the schema-version gate): a throwing OnError must never
+            // bypass the DLQ write / commit, or the record would be redelivered and fail forever.
+            await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
+            Commit(result);
+            SafeReport(
+                new BabelQueueException("Rejected a Kafka record: the body is not valid UTF-8."),
+                EmptyEnvelope(),
+                result);
+            return;
+        }
+
+        var envelope = Reconcile(EnvelopeCodec.Decode(body), headers);
 
         if (!EnvelopeCodec.Accepts(envelope))
         {
@@ -215,9 +233,10 @@ public sealed class KafkaConsumer
     private static Envelope EmptyEnvelope() => new(null, null, null, null, 0, null);
 
     /// <summary>
-    /// Invokes <see cref="KafkaConsumerOptions.OnError"/> on the schema-version-gate path, where it must not be
-    /// able to disturb settlement: a throwing callback is swallowed (there is no safer sink than the consumer
-    /// itself) so the already-performed commit / seek-back stands and the loop keeps running.
+    /// Invokes <see cref="KafkaConsumerOptions.OnError"/> on the raw-DLQ paths (schema-version gate, invalid UTF-8
+    /// body), where it must not be able to disturb settlement: a throwing callback is swallowed (there is no
+    /// safer sink than the consumer itself) so the already-performed commit / seek-back stands and the loop
+    /// keeps running.
     /// </summary>
     private void SafeReport(Exception error, Envelope envelope, ConsumeResult<byte[], byte[]> result)
     {
@@ -358,8 +377,25 @@ public sealed class KafkaConsumer
 
     private void Commit(ConsumeResult<byte[], byte[]> result) => _consumer.Commit(result);
 
-    private static string Value(ConsumeResult<byte[], byte[]> result) =>
-        result.Message.Value is { } v ? Encoding.UTF8.GetString(v) : string.Empty;
+    // Strict UTF-8 (no BOM emission, throws on invalid bytes) instead of Encoding.UTF8's silent U+FFFD replacement.
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    /// <summary>The record value as a string, "" for a null value, or null when it is not valid UTF-8.</summary>
+    private static string? StrictBody(ConsumeResult<byte[], byte[]> result)
+    {
+        if (result.Message.Value is not { } v)
+        {
+            return string.Empty;
+        }
+        try
+        {
+            return StrictUtf8.GetString(v);
+        }
+        catch (DecoderFallbackException)
+        {
+            return null;
+        }
+    }
 
     private static string OriginalTopic(ConsumeResult<byte[], byte[]> result) =>
         KafkaHeaders.GetString(result.Message.Headers, KafkaHeaders.OriginalTopic) ?? result.Topic;
