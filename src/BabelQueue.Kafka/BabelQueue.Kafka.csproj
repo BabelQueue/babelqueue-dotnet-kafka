@@ -13,7 +13,7 @@
     <AnalysisLevel>latest-recommended</AnalysisLevel>
 
     <PackageId>BabelQueue.Kafka</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Authors>Muhammet Şafak</Authors>
     <Company>BabelQueue</Company>
     <Description>Apache Kafka transport for BabelQueue — a canonical-envelope publisher and a URN-routed, process-then-commit consumer (SDK-owned retry topics + DLQ) over Confluent.Kafka, on the framework-agnostic core.</Description>
