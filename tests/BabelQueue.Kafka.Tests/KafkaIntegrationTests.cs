@@ -189,4 +189,119 @@ public sealed class KafkaIntegrationTests
         Assert.Equal("2", KafkaHeaders.GetString(dead.Message.Headers, KafkaHeaders.SchemaVersion));
         Assert.Equal(0, handled);
     }
+
+    /// <summary>Read the first <paramref name="count"/> records of a single-partition topic from the beginning.</summary>
+    private static List<ConsumeResult<byte[], byte[]>> ReadRecords(string topic, int count)
+    {
+        var records = new List<ConsumeResult<byte[], byte[]>>();
+        using var reader = NewConsumer("bq-it-read-" + Guid.NewGuid(), topic);
+        var stop = DateTime.UtcNow + Deadline;
+        while (records.Count < count && DateTime.UtcNow < stop)
+        {
+            var result = reader.Consume(TimeSpan.FromMilliseconds(500));
+            if (result?.Message is not null)
+            {
+                records.Add(result);
+            }
+        }
+        Assert.True(records.Count >= count, $"expected {count} record(s) on {topic}, read {records.Count} within {Deadline}");
+        return records;
+    }
+
+    // A null key (no key at all) and an empty key (zero-length) are different on the wire, so the
+    // null-ness is asserted separately from the byte comparison.
+    private static void AssertSameKey(string hop, byte[]? expected, byte[]? actual)
+    {
+        Assert.True(expected is null == actual is null, $"{hop}: null-ness changed (expected {(expected is null ? "null" : "set")}, got {(actual is null ? "null" : "set")})");
+        Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
+    /// Seed one record with <paramref name="key"/>, fail its handler to the DLQ, then dry-run and redrive it, reading the
+    /// records back from the broker and asserting the key at every hop (§6.5).
+    /// </summary>
+    private static async Task AssertKeySurvivesRetryDlqAndRedriveAsync(byte[]? key)
+    {
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var work = "bq-it-key-" + suffix;
+        var sandbox = "bq-it-key-sandbox-" + suffix;
+        var topology = RetryTopics.ForTopic(work).Tier(TimeSpan.FromSeconds(1)).Build();
+        var retry = topology.Tiers[0].Topic;
+        var dlq = topology.DlqTopic!;
+        await CreateTopicsAsync(work, retry, dlq, sandbox);
+
+        var calls = 0;
+        using var producer = NewProducer();
+        using (var raw = NewConsumer("bq-it-group-" + suffix, work, retry))
+        {
+            var handlers = new Dictionary<string, BabelHandler>
+            {
+                [Urn] = (_, _, _) =>
+                {
+                    Interlocked.Increment(ref calls);
+                    throw new InvalidOperationException("boom");
+                },
+            };
+            var worker = new KafkaConsumer(raw, handlers, new KafkaConsumerOptions
+            {
+                Producer = producer,
+                RetryTopics = topology,
+                MaxTries = 2,
+                PollTimeout = TimeSpan.FromMilliseconds(500),
+            });
+
+            var envelope = EnvelopeCodec.Make(Urn, new Dictionary<string, object?> { ["order_id"] = 7 }, work, "trace-it-key");
+            await producer.ProduceAsync(work, new Message<byte[], byte[]>
+            {
+                Key = key!,
+                Value = Encoding.UTF8.GetBytes(EnvelopeCodec.Encode(envelope)),
+                Headers = KafkaHeaders.Project(envelope),
+            });
+
+            var stop = DateTime.UtcNow + Deadline;
+            while (Volatile.Read(ref calls) < 2 && DateTime.UtcNow < stop)
+            {
+                await worker.PollAsync();
+            }
+            Assert.Equal(2, calls);
+            // One more poll settles the terminal record (the DLQ write is confirmed before it returns).
+            await worker.PollAsync();
+        }
+
+        AssertSameKey("seed", key, ReadRecords(work, 1)[0].Message.Key);
+        AssertSameKey("retry republish", key, ReadRecords(retry, 1)[0].Message.Key);
+        AssertSameKey("DLQ write", key, ReadRecords(dlq, 1)[0].Message.Key);
+
+        // Dry run restores the record verbatim onto the DLQ (original + restore); the real redrive then drains the
+        // restore (the group's committed offset is past the original) onto a sandbox topic. A pop can return nothing
+        // while the consumer group is still joining, so each run repeats until it saw a record (an empty run has no
+        // side effects).
+        using var ops = NewConsumer("bq-it-ops-" + suffix, dlq);
+        var transport = new KafkaRedriveTransport(ops, producer, TimeSpan.FromSeconds(2));
+        var until = DateTime.UtcNow + Deadline;
+        var dry = await Redrive.RedriveAsync(transport, dlq, new Redrive.Options(DryRun: true, Max: 1));
+        while (dry.Items.Count == 0 && DateTime.UtcNow < until)
+        {
+            dry = await Redrive.RedriveAsync(transport, dlq, new Redrive.Options(DryRun: true, Max: 1));
+        }
+        Assert.Single(dry.Items);
+        AssertSameKey("dry-run restore", key, ReadRecords(dlq, 2)[1].Message.Key);
+
+        var moved = await Redrive.RedriveAsync(transport, dlq, new Redrive.Options(ToQueue: sandbox, Max: 1));
+        while (moved.Items.Count == 0 && DateTime.UtcNow < until)
+        {
+            moved = await Redrive.RedriveAsync(transport, dlq, new Redrive.Options(ToQueue: sandbox, Max: 1));
+        }
+        Assert.Equal(1, moved.Redriven);
+        AssertSameKey("redrive", key, ReadRecords(sandbox, 1)[0].Message.Key);
+    }
+
+    [KafkaIntegrationFact]
+    public Task NullRecordKeySurvivesRetryDlqAndRedrive() => AssertKeySurvivesRetryDlqAndRedriveAsync(null);
+
+    [KafkaIntegrationFact]
+    public Task EmptyRecordKeySurvivesRetryDlqAndRedrive() => AssertKeySurvivesRetryDlqAndRedriveAsync(Array.Empty<byte>());
+
+    [KafkaIntegrationFact]
+    public Task NonEmptyRecordKeySurvivesRetryDlqAndRedrive() => AssertKeySurvivesRetryDlqAndRedriveAsync(Encoding.UTF8.GetBytes("customer-42"));
 }
