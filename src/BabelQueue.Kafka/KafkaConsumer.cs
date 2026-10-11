@@ -328,7 +328,7 @@ public sealed class KafkaConsumer
         var headers = KafkaHeaders.Project(bumped);
         KafkaHeaders.Add(headers, KafkaHeaders.Delay, ((long)tier.Delay.TotalMilliseconds).ToString(System.Globalization.CultureInfo.InvariantCulture));
         KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, OriginalTopic(result));
-        await ProduceAsync(tier.Topic, bumped, headers, cancellationToken).ConfigureAwait(false);
+        await ProduceAsync(tier.Topic, result.Message.Key, bumped, headers, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task DeadLetterAsync(Envelope envelope, ConsumeResult<byte[], byte[]> result, string reason, Exception? error, CancellationToken cancellationToken)
@@ -342,7 +342,7 @@ public sealed class KafkaConsumer
         var annotated = DeadLetters.Annotate(envelope, reason, original, envelope.Attempts, error?.Message, error?.GetType().FullName);
         var headers = KafkaHeaders.Project(annotated);
         KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, original);
-        await ProduceAsync(dlq, annotated, headers, cancellationToken).ConfigureAwait(false);
+        await ProduceAsync(dlq, result.Message.Key, annotated, headers, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task DeadLetterRawAsync(ConsumeResult<byte[], byte[]> result, CancellationToken cancellationToken)
@@ -363,11 +363,14 @@ public sealed class KafkaConsumer
         await _options.Producer!.ProduceAsync(dlq, message, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task ProduceAsync(string topic, Envelope envelope, Headers headers, CancellationToken cancellationToken)
+    // The source record's key is carried unchanged (null stays null, empty stays empty, nothing is synthesised) so a
+    // keyed stream keeps its key across retry tiers and the DLQ.
+    private async Task ProduceAsync(string topic, byte[]? key, Envelope envelope, Headers headers, CancellationToken cancellationToken)
     {
         RequireProducer();
         var message = new Message<byte[], byte[]>
         {
+            Key = key!,
             Value = Encoding.UTF8.GetBytes(EnvelopeCodec.Encode(envelope)),
             Headers = headers,
             Timestamp = new Timestamp(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), TimestampType.CreateTime),
