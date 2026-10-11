@@ -7,6 +7,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+- `KafkaRedriveTransport` now implements the core's optional `Redrive.IRewinder`. Whenever an exception ends a DLQ redrive run early — a failed restore write back to the DLQ, a failed redrive write (whose restore succeeded or not), a failed commit, or a throwing `Select` callback — `Redrive.RedriveAsync` calls `RewindAsync`, which seeks **every partition that still has a handed-out, uncommitted record** back to its lowest such offset (the same `Seek` path `KafkaConsumer` uses), so the whole rest of the drained batch is redelivered on the next poll, not just the failed record's partition. Kafka commits are cumulative, so without this a later commit by the same consumer could move the group past an unsettled DLQ record and lose it. Records already committed (including a restored record) are never sought back to, so nothing is duplicated. If the seek also fails, both errors are reported together. **Requires the `BabelQueue.Core` release that ships `Redrive.IRewinder` (1.10.0)**; the package reference is raised accordingly. No change to the wire envelope, `dead_letter` shape or header names.
+
 ## [1.1.0] - 2026-10-11
 
 ### Added

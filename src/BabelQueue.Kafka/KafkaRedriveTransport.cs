@@ -27,12 +27,24 @@ namespace BabelQueue.Kafka;
 /// being published (a decodable envelope only), so the redriven record carries the reset <c>attempts</c> and no
 /// stale <c>dead_letter</c> metadata. The <c>Bypass</c> option's <c>bq-replay-bypass</c> header is not propagated
 /// by this transport.</para>
+///
+/// <para>It also implements <see cref="Redrive.IRewinder"/>. The transport remembers every record it has handed
+/// out and not yet committed, per partition. When a restore write back to the DLQ fails — or a run aborts after a
+/// failed redrive write — <see cref="RewindAsync"/> <b>seeks every partition that still has such a record back to
+/// its lowest uncommitted offset</b> (<see cref="IConsumer{TKey, TValue}.Seek"/>, the same path
+/// <see cref="KafkaConsumer"/> uses) and commits nothing, so the whole rest of the drained batch is delivered
+/// again, not just the failed record's partition. A Kafka commit is cumulative, so merely leaving a record
+/// unacknowledged is not enough — a later commit on its partition would otherwise move the group past it and lose
+/// it. A record already committed is never seeked back to, so it is not delivered (and restored) twice.</para>
 /// </summary>
-public sealed class KafkaRedriveTransport : Redrive.ITransport, Redrive.IKeyedRepublisher
+public sealed class KafkaRedriveTransport : Redrive.ITransport, Redrive.IKeyedRepublisher, Redrive.IRewinder
 {
     private readonly IConsumer<byte[], byte[]> _consumer;
     private readonly IProducer<byte[], byte[]> _producer;
     private readonly TimeSpan _pollTimeout;
+    // Offsets handed out by PopAsync and not yet committed, per partition (the rewind targets).
+    private readonly Dictionary<TopicPartition, SortedSet<long>> _unsettled = new();
+    private readonly object _gate = new();
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     /// <summary>A redrive transport that polls the DLQ with a 1 second timeout.</summary>
@@ -76,6 +88,17 @@ public sealed class KafkaRedriveTransport : Redrive.ITransport, Redrive.IKeyedRe
                 continue;
             }
 
+            lock (_gate)
+            {
+                if (!_unsettled.TryGetValue(result.TopicPartition, out var offsets))
+                {
+                    offsets = new SortedSet<long>();
+                    _unsettled[result.TopicPartition] = offsets;
+                }
+
+                offsets.Add(result.Offset.Value);
+            }
+
             // Strict decode: a lenient one would swap invalid bytes for U+FFFD, and a restore must never alter the
             // record. An unreadable (invalid UTF-8) or null value is handed out as an empty body, which Redrive
             // treats as undecodable and restores - and PublishFromAsync then re-writes the ORIGINAL bytes.
@@ -98,8 +121,58 @@ public sealed class KafkaRedriveTransport : Redrive.ITransport, Redrive.IKeyedRe
     /// <inheritdoc />
     public Task AckAsync(Redrive.Reserved message)
     {
-        _consumer.Commit(Record(message));
+        var record = Record(message);
+        _consumer.Commit(record);
+        lock (_gate)
+        {
+            if (_unsettled.TryGetValue(record.TopicPartition, out var offsets))
+            {
+                offsets.Remove(record.Offset.Value);
+                if (offsets.Count == 0)
+                {
+                    _unsettled.Remove(record.TopicPartition);
+                }
+            }
+        }
+
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Seeks every partition that still has a handed-out, uncommitted record back to its lowest such offset.
+    /// <paramref name="message"/> only identifies the trigger (it may already be committed, e.g. after a failed
+    /// redrive write whose restore succeeded) and is not a seek target of its own. A failed seek is reported
+    /// after the other partitions were still rewound; the partition stays tracked.
+    /// </summary>
+    public Task RewindAsync(Redrive.Reserved message)
+    {
+        List<Exception>? failures = null;
+        lock (_gate)
+        {
+            foreach (var (partition, offsets) in _unsettled.ToArray())
+            {
+                try
+                {
+                    _consumer.Seek(new TopicPartitionOffset(partition, new Offset(offsets.Min)));
+                    _unsettled.Remove(partition);
+                }
+#pragma warning disable CA1031 // every partition must be rewound; the failures are rethrown together below
+                catch (Exception seekError)
+#pragma warning restore CA1031
+                {
+                    (failures ??= new List<Exception>()).Add(seekError);
+                }
+            }
+        }
+
+        if (failures is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        return failures.Count == 1
+            ? Task.FromException(failures[0])
+            : Task.FromException(new AggregateException(failures));
     }
 
     /// <summary>Write the DLQ record back unchanged (value bytes, headers, key) with a fresh timestamp.</summary>
