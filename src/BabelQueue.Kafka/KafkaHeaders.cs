@@ -30,7 +30,11 @@ internal static class KafkaHeaders
         if (envelope.Meta is { } meta)
         {
             Put(headers, MessageId, meta.Id);
-            headers.Add(SchemaVersion, Bytes(meta.SchemaVersion.ToString(CultureInfo.InvariantCulture)));
+            if (meta.SchemaVersion > 0)
+            {
+                // 0 means "absent" (a lenient decode of a body without meta.schema_version); never project it.
+                headers.Add(SchemaVersion, Bytes(meta.SchemaVersion.ToString(CultureInfo.InvariantCulture)));
+            }
             Put(headers, SourceLang, meta.Lang);
         }
         headers.Add(Attempts, Bytes(envelope.Attempts.ToString(CultureInfo.InvariantCulture)));

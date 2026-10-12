@@ -129,7 +129,7 @@ public sealed class KafkaConsumerTests
     }
 
     [Fact]
-    public async Task RawDlqPreservesSourceKey()
+    public async Task PoisonDlqPreservesSourceKey()
     {
         var key = Encoding.UTF8.GetBytes("customer-42");
         var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
@@ -149,6 +149,7 @@ public sealed class KafkaConsumerTests
 
         Assert.Equal("orders.dlq", captured[0].Topic);
         Assert.Equal(key, captured[0].Message.Key);
+        Assert.Equal("poison", ParseValue(captured[0].Message).GetProperty("dead_letter").GetProperty("reason").GetString());
     }
 
     [Fact]
@@ -210,15 +211,15 @@ public sealed class KafkaConsumerTests
         Assert.Equal("orders.retry.1", captured[0].Topic);
     }
 
-    [Fact]
-    public async Task PoisonBodyForwardedRawToDlq()
+    private static async Task<(Message<byte[], byte[]> Dlq, Mock<IConsumer<byte[], byte[]>> Consumer, Exception? Reported)> RunPoison(
+        byte[] body, Headers? headers = null, byte[]? key = null)
     {
         var result = new ConsumeResult<byte[], byte[]>
         {
             Topic = "orders",
             Partition = new Partition(0),
             Offset = new Offset(4),
-            Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes("not-json"), Headers = new Headers() },
+            Message = new Message<byte[], byte[]> { Key = key!, Value = body, Headers = headers ?? new Headers() },
         };
         var consumer = ConsumerWith(result);
         var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
@@ -231,8 +232,94 @@ public sealed class KafkaConsumerTests
             OnError = (e, _, _) => reported = e,
         }).PollAsync();
 
-        Assert.Equal("orders.dlq", captured[0].Topic);
+        var sent = Assert.Single(captured);
+        Assert.Equal("orders.dlq", sent.Topic);
+        return (sent.Message, consumer, reported);
+    }
+
+    private static System.Text.Json.JsonElement ParseValue(Message<byte[], byte[]> message) =>
+        System.Text.Json.JsonDocument.Parse(message.Value).RootElement.Clone();
+
+    [Fact]
+    public async Task PoisonBodyIsWrappedWithPoisonDeadLetterAndKeyKept()
+    {
+        var key = Encoding.UTF8.GetBytes("customer-42");
+        var (dlq, consumer, reported) = await RunPoison(Encoding.UTF8.GetBytes("not-json"), key: key);
+
+        var value = ParseValue(dlq);
+        Assert.Equal("not-json", value.GetProperty("raw").GetString());
+        var deadLetter = value.GetProperty("dead_letter");
+        Assert.Equal("poison", deadLetter.GetProperty("reason").GetString());
+        Assert.Equal("orders", deadLetter.GetProperty("original_queue").GetString());
+        Assert.Equal(0, deadLetter.GetProperty("attempts").GetInt32());
+        Assert.Equal("dotnet", deadLetter.GetProperty("lang").GetString());
+        Assert.False(string.IsNullOrEmpty(deadLetter.GetProperty("error").GetString()));
+        Assert.Equal("BabelQueue.BabelQueueException", deadLetter.GetProperty("exception").GetString());
+        Assert.True(deadLetter.GetProperty("failed_at").GetInt64() > 0);
+        Assert.Equal(key, dlq.Key);
+        Assert.Equal("orders", KafkaHeaders.GetString(dlq.Headers, KafkaHeaders.OriginalTopic));
         Assert.NotNull(reported);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task PoisonJsonObjectKeepsItsKeysAndReplacesAnExistingDeadLetter()
+    {
+        // data is a list (not an object): the decoder rejects it, so it is poison; its keys are kept verbatim
+        // (the number is not reformatted) and the stale dead_letter is overridden.
+        var body = "{\"job\":\"urn:babel:orders:created\",\"data\":[1],\"price\":1.50,\"dead_letter\":{\"reason\":\"failed\"}}";
+        var (dlq, _, _) = await RunPoison(Encoding.UTF8.GetBytes(body));
+
+        var value = ParseValue(dlq);
+        Assert.False(value.TryGetProperty("raw", out _));
+        Assert.Equal("urn:babel:orders:created", value.GetProperty("job").GetString());
+        Assert.Equal(System.Text.Json.JsonValueKind.Array, value.GetProperty("data").ValueKind);
+        Assert.Contains("\"price\":1.50", Encoding.UTF8.GetString(dlq.Value));
+        Assert.Equal("poison", value.GetProperty("dead_letter").GetProperty("reason").GetString());
+        Assert.Equal("urn:babel:orders:created", KafkaHeaders.GetString(dlq.Headers, KafkaHeaders.Job));
+    }
+
+    [Theory]
+    [InlineData("[1,2]")]
+    [InlineData("{\"a\":1} {\"b\":2}")]
+    [InlineData("")]
+    public async Task PoisonNonObjectBodiesAreCarriedAsRaw(string body)
+    {
+        var (dlq, _, _) = await RunPoison(Encoding.UTF8.GetBytes(body));
+
+        var value = ParseValue(dlq);
+        Assert.Equal(body, value.GetProperty("raw").GetString());
+        Assert.Equal("poison", value.GetProperty("dead_letter").GetProperty("reason").GetString());
+    }
+
+    [Fact]
+    public async Task PoisonDeadLetterNeverProjectsAZeroSchemaVersionHeader()
+    {
+        // No meta.schema_version → lenient decode yields 0, which must not become `bq-schema-version: 0`
+        // (a later §6.7 gate would reject the DLQ record).
+        var (dlq, _, _) = await RunPoison(Encoding.UTF8.GetBytes("not-json"));
+
+        Assert.False(dlq.Headers.TryGetLastBytes(KafkaHeaders.SchemaVersion, out _));
+    }
+
+    [Fact]
+    public async Task PoisonDeadLetterAttemptsComesFromTheAttemptsHeader()
+    {
+        var headers = new Headers { { KafkaHeaders.Attempts, Encoding.UTF8.GetBytes("2") } };
+        var (dlq, _, _) = await RunPoison(Encoding.UTF8.GetBytes("not-json"), headers);
+
+        Assert.Equal(2, ParseValue(dlq).GetProperty("dead_letter").GetProperty("attempts").GetInt32());
+    }
+
+    [Fact]
+    public async Task TypedInvalidObjectIsWrappedAsPoisonKeepingItsKeys()
+    {
+        // A JSON object whose typed member has the wrong type (Go's Decode rejects it) keeps its keys.
+        var (dlq, consumer, _) = await RunPoison(Encoding.UTF8.GetBytes("{\"meta\":{\"created_at\":\"2026\"},\"extra\":true}"));
+
+        var value = ParseValue(dlq);
+        Assert.True(value.GetProperty("extra").GetBoolean());
+        Assert.Equal("poison", value.GetProperty("dead_letter").GetProperty("reason").GetString());
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
     }
 
@@ -446,7 +533,7 @@ public sealed class KafkaConsumerTests
     };
 
     [Fact]
-    public async Task InvalidUtf8BodyIsForwardedRawToDlqNotDecodedWithReplacementChars()
+    public async Task InvalidUtf8BodyIsWrappedAsPoisonWithReplacementCharsNotDecoded()
     {
         var body = EnvelopeBytesWithInvalidUtf8();
         Assert.Contains((byte)0xFF, body);
@@ -470,8 +557,11 @@ public sealed class KafkaConsumerTests
         Assert.IsType<BabelQueueException>(reported);
         var dlq = Assert.Single(captured);
         Assert.Equal("orders.dlq", dlq.Topic);
-        Assert.Equal(body, dlq.Message.Value); // original bytes, byte for byte
         Assert.Equal(Encoding.UTF8.GetBytes("k1"), dlq.Message.Key);
+        var value = ParseValue(dlq.Message);
+        Assert.Equal("poison", value.GetProperty("dead_letter").GetProperty("reason").GetString());
+        // The bad byte is stored as U+FFFD inside the (still valid) object; the handler never saw it.
+        Assert.Contains("\uFFFD", value.GetProperty("data").GetProperty("order_id").GetString());
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
     }
 
@@ -744,7 +834,7 @@ public sealed class KafkaConsumerTests
         {
             _records = new List<ConsumeResult<byte[], byte[]>>(records);
             Mock.Setup(c => c.Consume(It.IsAny<TimeSpan>())).Returns(() =>
-                Position < _records.Count ? _records[Position++] : null);
+                Position < _records.Count ? _records[Position++] : null!);
             Mock.Setup(c => c.Seek(It.IsAny<TopicPartitionOffset>())).Callback<TopicPartitionOffset>(t =>
                 Position = _records.FindIndex(r => r.Offset == t.Offset));
             Mock.Setup(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()))
@@ -916,7 +1006,7 @@ public sealed class KafkaConsumerTests
     public async Task PollReturnsZeroOnTimeout()
     {
         var consumer = new Mock<IConsumer<byte[], byte[]>>();
-        consumer.Setup(c => c.Consume(It.IsAny<TimeSpan>())).Returns((ConsumeResult<byte[], byte[]>?)null);
+        consumer.Setup(c => c.Consume(It.IsAny<TimeSpan>())).Returns((ConsumeResult<byte[], byte[]>)null!);
         var count = await new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>()).PollAsync();
         Assert.Equal(0, count);
     }

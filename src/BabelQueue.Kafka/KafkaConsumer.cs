@@ -1,5 +1,7 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 using Confluent.Kafka;
 
 namespace BabelQueue.Kafka;
@@ -131,45 +133,41 @@ public sealed class KafkaConsumer
             return;
         }
 
+        // Undecodable / poison body (§6.5): dead-letter it WRAPPED (reason "poison"), as the Go reference does, with
+        // the record key unchanged. Invalid UTF-8 is poison too (a lenient decoder would hand a corrupted payload
+        // to a handler); the wrapper then carries the body with U+FFFD substitutions.
+        // Settle FIRST, report afterwards (as on the schema-version gate): a throwing OnError must never bypass
+        // the DLQ write / commit, or the record would be redelivered and fail forever. A failed write seeks back
+        // without committing, like every other poison record.
         var body = StrictBody(result);
-        if (body is null)
+        var undecodable = body is null
+            ? new BabelQueueException("Rejected a Kafka record: the body is not valid UTF-8.")
+            : DecodeFailure(body);
+        if (undecodable is not null)
         {
-            // Invalid UTF-8: a lenient decoder would silently swap the bad bytes for U+FFFD and hand a corrupted
-            // payload to a handler. Treat it as poison instead (parity with the Java/Go/Node consumers): the
-            // ORIGINAL bytes go raw to the DLQ and the offset is committed. A failed DLQ write throws out of
-            // here and PollAsync seeks back without committing, like every other poison record.
-            // Settle FIRST, report afterwards (as on the schema-version gate): a throwing OnError must never
-            // bypass the DLQ write / commit, or the record would be redelivered and fail forever.
-            await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
-            Commit(result);
-            SafeReport(
-                new BabelQueueException("Rejected a Kafka record: the body is not valid UTF-8."),
-                EmptyEnvelope(),
-                result);
+            await SettlePoisonAsync(result, body ?? Encoding.UTF8.GetString(result.Message.Value), undecodable, EmptyEnvelope(), cancellationToken)
+                .ConfigureAwait(false);
             return;
         }
 
-        var envelope = Reconcile(EnvelopeCodec.Decode(body), headers);
-
-        if (!EnvelopeCodec.Accepts(envelope))
+        // The shape scan accepts everything Go's typed Decode accepts, but the core codec is stricter in places
+        // (e.g. a lone surrogate escape it cannot carry). Whatever it throws, the record is poison: it must be parked,
+        // never allowed to escape PollAsync (a seek-back + redelivery would wedge the partition on it forever).
+        Envelope envelope;
+        try
         {
-            // A non-conformant / poison record: forward the raw bytes to the DLQ for triage.
-            // Settle FIRST, report afterwards (as on the schema-version gate): a throwing OnError must never
-            // bypass the DLQ write / commit, or the record would be redelivered and fail forever.
-            var rejected = new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Kafka.");
-            try
-            {
-                await DeadLetterRawAsync(result, cancellationToken).ConfigureAwait(false);
-                Commit(result);
-            }
-#pragma warning disable CA1031 // Seek back, then report the rejection, whatever the settlement failure was.
-            catch (Exception settleError)
+            envelope = Reconcile(EnvelopeCodec.Decode(body!), headers);
+        }
+#pragma warning disable CA1031 // Any decode failure is poison (Go parity), whatever its type.
+        catch (Exception decodeError) when (decodeError is not OperationCanceledException)
 #pragma warning restore CA1031
-            {
-                SeekBackThenReport(result, settleError, rejected, envelope);
-                throw;
-            }
-            SafeReport(rejected, envelope, result);
+        {
+            await SettlePoisonAsync(
+                result,
+                body!,
+                decodeError as BabelQueueException ?? new BabelQueueException("Undecodable BabelQueue body: " + decodeError.Message, decodeError),
+                EmptyEnvelope(),
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -276,7 +274,7 @@ public sealed class KafkaConsumer
 
     /// <summary>
     /// Invokes <see cref="KafkaConsumerOptions.OnError"/> on every settlement path (schema-version gate, invalid
-    /// UTF-8 body, non-conformant envelope, handler failure, unknown URN), where it must not be able to disturb
+    /// UTF-8 body, undecodable body, handler failure, unknown URN), where it must not be able to disturb
     /// settlement: a throwing callback is swallowed (there is no safer sink than the consumer itself) so the
     /// already-performed commit / seek-back stands and the loop keeps running.
     /// </summary>
@@ -385,6 +383,147 @@ public sealed class KafkaConsumer
         var headers = KafkaHeaders.Project(annotated);
         KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, original);
         await ProduceAsync(dlq, result.Message.Key, annotated, headers, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task SettlePoisonAsync(
+        ConsumeResult<byte[], byte[]> result, string body, Exception cause, Envelope envelope, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await DeadLetterPoisonAsync(result, body, cause, cancellationToken).ConfigureAwait(false);
+            Commit(result);
+        }
+#pragma warning disable CA1031 // Seek back, then report the rejection, whatever the settlement failure was.
+        catch (Exception settleError)
+#pragma warning restore CA1031
+        {
+            SeekBackThenReport(result, settleError, cause, envelope);
+            throw;
+        }
+        SafeReport(cause, envelope, result);
+    }
+
+    /// <summary>
+    /// Why <paramref name="body"/> is not a decodable BabelQueue envelope, or null when it is: exactly the bodies the
+    /// Go reference's typed <c>Decode</c> rejects (see <see cref="EnvelopeShape"/>). A well-typed object that merely
+    /// fails <see cref="EnvelopeCodec.Accepts"/> is not undecodable.
+    /// </summary>
+    internal static BabelQueueException? DecodeFailure(string body) => EnvelopeShape.Violation(body);
+
+    private static readonly JsonWriterOptions PoisonWriterOptions = new()
+    {
+        MaxDepth = 10_100, // the shape scan allows Go's 10000 levels; the writer default (1000) would drop the keys of a deeper poison body
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        Indented = false,
+    };
+
+    /// <summary>
+    /// The poison DLQ body (Go parity): a body that is exactly one JSON object keeps its keys and values (numbers
+    /// are copied verbatim), anything else is carried as the string value of <c>raw</c>; a <c>dead_letter</c> block
+    /// with reason <c>poison</c> replaces any existing one.
+    /// </summary>
+    internal static string PoisonBody(string body, string? error, string? exception, long failedAt, string originalQueue, int attempts)
+    {
+        try
+        {
+            return BuildPoisonBody(body, error, exception, failedAt, originalQueue, attempts, keepMembers: true);
+        }
+        catch (InvalidOperationException)
+        {
+            // A lone UTF-16 surrogate escape inside a member cannot be copied by System.Text.Json: carry the whole
+            // body verbatim as `raw` instead, so the poison record is still parked and never left to wedge the partition.
+            return BuildPoisonBody(body, error, exception, failedAt, originalQueue, attempts, keepMembers: false);
+        }
+    }
+
+    private static string BuildPoisonBody(string body, string? error, string? exception, long failedAt, string originalQueue, int attempts, bool keepMembers)
+    {
+        JsonDocument? doc = null;
+        try
+        {
+            doc = keepMembers ? JsonDocument.Parse(body, new JsonDocumentOptions { MaxDepth = 10_000 }) : null;
+        }
+        catch (JsonException)
+        {
+            // not JSON: wrapped below
+        }
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, PoisonWriterOptions))
+        {
+            writer.WriteStartObject();
+            if (doc is not null && doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                // Last duplicate wins (like Go's map), first-seen order is kept.
+                var order = new List<string>();
+                var values = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+                foreach (var property in doc.RootElement.EnumerateObject())
+                {
+                    if (!values.ContainsKey(property.Name))
+                    {
+                        order.Add(property.Name);
+                    }
+                    values[property.Name] = property.Value;
+                }
+                foreach (var name in order)
+                {
+                    if (name == "dead_letter")
+                    {
+                        continue;
+                    }
+                    writer.WritePropertyName(name);
+                    values[name].WriteTo(writer);
+                }
+            }
+            else
+            {
+                writer.WriteString("raw", body);
+            }
+            writer.WriteStartObject("dead_letter");
+            writer.WriteString("reason", "poison");
+            if (error is null) { writer.WriteNull("error"); } else { writer.WriteString("error", error); }
+            if (exception is null) { writer.WriteNull("exception"); } else { writer.WriteString("exception", exception); }
+            writer.WriteNumber("failed_at", failedAt);
+            writer.WriteString("original_queue", originalQueue);
+            writer.WriteNumber("attempts", attempts);
+            writer.WriteString("lang", EnvelopeCodec.SourceLang);
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+        doc?.Dispose();
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private async Task DeadLetterPoisonAsync(ConsumeResult<byte[], byte[]> result, string body, Exception cause, CancellationToken cancellationToken)
+    {
+        var dlq = _options.RetryTopics?.DlqTopic;
+        if (dlq is null)
+        {
+            return; // dead-lettering disabled → degrade to commit-and-drop
+        }
+        RequireProducer();
+        var original = OriginalTopic(result);
+        var attempts = Math.Max(KafkaHeaders.GetInt(result.Message.Headers, KafkaHeaders.Attempts, 0), 0);
+        var json = PoisonBody(body, cause.Message, cause.GetType().FullName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), original, attempts);
+        Headers headers;
+        try
+        {
+            headers = KafkaHeaders.Project(EnvelopeCodec.Decode(json, static _ => { }));
+        }
+#pragma warning disable CA1031 // Header projection is best-effort: the poison record must be parked regardless.
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            headers = new Headers();
+        }
+        KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, original);
+        var message = new Message<byte[], byte[]>
+        {
+            Key = result.Message.Key,
+            Value = Encoding.UTF8.GetBytes(json),
+            Headers = headers,
+            Timestamp = new Timestamp(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), TimestampType.CreateTime),
+        };
+        await _options.Producer!.ProduceAsync(dlq, message, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task DeadLetterRawAsync(ConsumeResult<byte[], byte[]> result, CancellationToken cancellationToken)

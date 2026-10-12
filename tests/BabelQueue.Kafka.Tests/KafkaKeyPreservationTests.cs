@@ -13,7 +13,7 @@ namespace BabelQueue.Kafka.Tests;
 
 /// <summary>
 /// The original record key must survive every consumer-side republish: the retry-tier write, the unknown-URN
-/// release, the envelope DLQ, and the raw/poison DLQ. A null key stays null, an empty key stays empty and
+/// release, the envelope DLQ, the wrapped poison DLQ, and the raw schema-version-gate DLQ. A null key stays null, an empty key stays empty and
 /// no key is ever synthesised.
 /// </summary>
 public sealed class KafkaKeyPreservationTests
@@ -123,8 +123,8 @@ public sealed class KafkaKeyPreservationTests
 
     [Theory]
     [MemberData(nameof(Keys))]
-    public async Task NonConformantEnvelopeDlqKeepsKey(byte[]? key) =>
-        // "not-json" decodes leniently but fails the conformance check -> annotated "poison" envelope DLQ.
+    public async Task PoisonDlqKeepsKey(byte[]? key) =>
+        // "not-json" is undecodable -> wrapped {"raw": ...} poison DLQ record; the key is carried unchanged.
         AssertKey(key, await Run(Keyed(key, Encoding.UTF8.GetBytes("not-json"), new Headers()), new Dictionary<string, BabelHandler>(), "orders.dlq"));
 
     [Theory]
