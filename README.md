@@ -90,8 +90,8 @@ synthesised — contract §6.5), on both the redrive write to the work topic and
 (original value bytes, headers and key, fresh timestamp); a record that is not valid UTF-8 is restored
 byte-for-byte and committed only after that write succeeded. A redrive to the work topic re-projects the `bq-`
 headers from the reset envelope; the `bq-replay-bypass` header is not propagated. Offsets are committed only after
-the re-publish (at-least-once). Requires `BabelQueue.Core` 1.9.0 (the release that ships
-`Redrive.IKeyedRepublisher`); do not push or release this package until that version is on NuGet.
+the re-publish (at-least-once). Requires `BabelQueue.Core` 1.10.0 or newer (`Redrive.IKeyedRepublisher`,
+`Redrive.IRewinder`).
 
 ## Contract mapping (§6)
 
