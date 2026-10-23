@@ -12,6 +12,12 @@ public sealed class RetryTopics
     /// <summary>A single delay tier: the <c>&lt;topic&gt;.retry.&lt;n&gt;</c> topic and the delay it holds for.</summary>
     public sealed record Tier(string Topic, TimeSpan Delay);
 
+    /// <summary>
+    /// The RECOMMENDED tier delays in milliseconds — 5s, 30s, 5m, 30m (ADR-0034 §2). Opt-in: nothing uses it unless
+    /// the caller picks it, e.g. <see cref="Builder.RecommendedTiers"/>; the default topology is unchanged.
+    /// </summary>
+    public static IReadOnlyList<int> RecommendedTierMillis { get; } = new[] { 5_000, 30_000, 300_000, 1_800_000 };
+
     private readonly List<Tier> _tiers;
 
     private RetryTopics(string workTopic, List<Tier> tiers, string? dlqTopic)
@@ -48,7 +54,11 @@ public sealed class RetryTopics
             $"Requested Kafka delay {delay.TotalMilliseconds}ms exceeds the largest retry tier ({_tiers[^1].Delay.TotalMilliseconds}ms).");
     }
 
-    /// <summary>The tier for a retry at <paramref name="attempt"/> (0-based), clamped to the largest (§6.5).</summary>
+    /// <summary>
+    /// The tier for a retry whose <c>attempts_before</c> is <paramref name="attempt"/> (0-based): tier number
+    /// <c>min(attempts_before, N-1) + 1</c>, so an exhausted list stays on the last tier (ADR-0034 §3, retry rule).
+    /// Deliberately separate from <see cref="TierForDelay"/>: a delay request never clamps, a retry always does.
+    /// </summary>
     public Tier TierForAttempt(int attempt)
     {
         RequireTiers();
@@ -80,6 +90,16 @@ public sealed class RetryTopics
         public Builder Tier(TimeSpan delay)
         {
             _delays.Add(delay);
+            return this;
+        }
+
+        /// <summary>Add the RECOMMENDED tiers (<see cref="RecommendedTierMillis"/>) — an explicit opt-in.</summary>
+        public Builder RecommendedTiers()
+        {
+            foreach (var millis in RecommendedTierMillis)
+            {
+                _delays.Add(TimeSpan.FromMilliseconds(millis));
+            }
             return this;
         }
 

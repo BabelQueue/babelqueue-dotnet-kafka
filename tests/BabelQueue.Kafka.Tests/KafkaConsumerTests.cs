@@ -81,6 +81,32 @@ public sealed class KafkaConsumerTests
         Assert.Equal(2, seen);
     }
 
+    [Theory]
+    [InlineData(1, "orders.retry.2")]
+    [InlineData(2, "orders.retry.2")]
+    [InlineData(9, "orders.retry.2")]
+    public async Task AFailureWithAttemptsBeforeAtOrAboveTheTierCountLandsInTheLastTier(int attemptsBefore, string expectedTopic)
+    {
+        var consumer = ConsumerWith(ResultFor(Envelope(attemptsBefore)));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            MaxTries = 20,
+        }).PollAsync();
+
+        Assert.Equal(expectedTopic, Assert.Single(captured).Topic);
+        Assert.Equal("60000", KafkaHeaders.GetString(captured[0].Message.Headers, KafkaHeaders.Delay));
+        Assert.Equal((attemptsBefore + 1).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            KafkaHeaders.GetString(captured[0].Message.Headers, KafkaHeaders.Attempts));
+    }
+
     [Fact]
     public async Task ThrowingHandlerRepublishesToRetryWithAttemptsPlusOne()
     {

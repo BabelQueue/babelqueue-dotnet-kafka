@@ -71,8 +71,50 @@ await worker.RunAsync(cancellationToken); // consume → process → commit
 
 A throwing handler republishes the envelope to the next `<topic>.retry.<n>` tier with
 `bq-attempts + 1`, then commits; once `MaxTries` is reached it goes to `<topic>.dlq` with a
-`dead_letter` block. An undecodable / poison body (invalid UTF-8, malformed JSON, not a JSON object, or any typed member the strict decode rejects such as `meta.created_at: "2026"`, with member names matched case-sensitively as the contract spells them, so a re-cased name is an unknown member, not poison; a well-typed but non-conformant envelope is not poison and is routed by URN) is dead-lettered **wrapped** with `dead_letter.reason = "poison"` (Go-style wrapping, except that invalid UTF-8 or a lone UTF-16 surrogate escape is poison here; any exception from the decode is also poison, never a stuck partition; a body that is one JSON object keeps its keys, anything else becomes `{"raw": "<body>"}`), key preserved. Poison wrapping copies the body as received and does not go through the encoder, so a poison body's forbidden or `urn` members are kept (ADR-0031's re-emit rules apply to decodable envelopes). Before decoding, the consumer reads the `bq-schema-version` header (UTF-8): absent or blank decodes as usual, any other value must be exactly `"1"`, otherwise the raw record is forwarded to `<topic>.dlq` and committed without being decoded (with no DLQ topic configured the forward is a no-op, so the record is just committed — it degrades to delete). If the DLQ write itself fails, the record is **not** committed: the consumer seeks back to its offset (so a later record's cumulative commit cannot skip it), reports via `OnError` (after the seek; a throwing `OnError` cannot bypass it), backs off for one `PollTimeout` and the loop keeps running. A header with a null value counts as absent. The consumer routes on the `bq-job` header. Unknown-URN strategy is one
+`dead_letter` block. An undecodable / poison body (invalid UTF-8, malformed JSON, not a JSON object, or any typed member the strict decode rejects such as `meta.created_at: "2026"`, with member names matched case-sensitively as the contract spells them, so a re-cased name is an unknown member, not poison; a well-typed but non-conformant envelope is not poison and is routed by URN; the one exception is a body with no identity at all, see below) is dead-lettered **wrapped** with `dead_letter.reason = "poison"` (Go-style wrapping, except that invalid UTF-8 or a lone UTF-16 surrogate escape is poison here; any exception from the decode is also poison, never a stuck partition; a body that is one JSON object keeps its keys, anything else becomes `{"raw": "<body>"}`), key preserved. Poison wrapping copies the body as received and does not go through the encoder, so a poison body's forbidden or `urn` members are kept (ADR-0031's re-emit rules apply to decodable envelopes). Before decoding, the consumer reads the `bq-schema-version` header (UTF-8): absent or blank decodes as usual, any other value must be exactly `"1"`, otherwise the raw record is forwarded to `<topic>.dlq` and committed without being decoded (with no DLQ topic configured the forward is a no-op, so the record is just committed — it degrades to delete). If the DLQ write itself fails, the record is **not** committed: the consumer seeks back to its offset (so a later record's cumulative commit cannot skip it), reports via `OnError` (after the seek; a throwing `OnError` cannot bypass it), backs off for one `PollTimeout` and the loop keeps running. A header with a null value counts as absent. The consumer routes on the `bq-job` header. Unknown-URN strategy is one
 of `fail` / `delete` / `release` / `dead_letter`.
+
+**No identity is poison (ADR-0034 §10).** A body whose `job` is absent, blank or not a string, with no usable `urn`
+alias, **and** no `bq-job` header has no identity and cannot be routed, so it is dead-lettered as poison
+(`dead_letter.reason = "poison"`, handler not called) instead of taking the unknown-URN path. `job` itself is not
+type-checked by the strict decode (a non-string `job` is ignored; a blank `job` falls back to `urn`, ADR-0032 §6).
+Duplicate top-level keys: the last one wins. The cross-SDK `kafka_poison` section of the conformance manifest
+(`expect: ok | no_identity | poison`) drives this in the test suite; on Kafka `no_identity` and `poison` are both
+dead-lettered.
+
+## Retry tiers and the re-inject consumer
+
+`RetryTopics.ForTopic("orders").RecommendedTiers().Build()` opts in to the ADR-0034 §2 recommended ladder
+(5 s, 30 s, 5 min, 30 min; `RetryTopics.RecommendedTierMillis`). It is an explicit opt-in: `Build()` with no tier
+still raises. A failure picks tier `n = min(attempts_before, N - 1) + 1`, so a message whose attempts already reach
+the tier count lands in the **last** tier rather than overflowing. A delayed publish picks the smallest tier that is
+at least the requested delay and raises when none is large enough (it never clamps down to a shorter tier).
+
+Retry topics do not delay by themselves. `KafkaReinjectConsumer` holds each record until `timestamp + tier_ms`
+(clamped to `[now, now + tier_ms]`, so a future or missing timestamp never waits longer than one tier), then
+re-produces it to the original topic and commits (ADR-0034 §5-§7):
+
+```csharp
+using var consumer = new ConsumerBuilder<byte[], byte[]>(new ConsumerConfig
+{
+    BootstrapServers = "localhost:9092",
+    GroupId = "orders-reinject",
+    EnableAutoCommit = false,
+}).Build();
+consumer.Subscribe(retry.Tiers.Select(t => t.Topic).ToList());
+
+var reinject = new KafkaReinjectConsumer(consumer, new KafkaReinjectOptions { Producer = producer, RetryTopics = retry });
+await reinject.RunAsync(cancellationToken);
+```
+
+The record is carried **byte-for-byte** (key, value and every header) except `bq-delay` and `bq-original-topic`,
+which are dropped; `traceparent` and the other headers are kept. The target is the `bq-original-topic` header, or the
+topic name with its `.retry.<n>` suffix removed when the header is absent; a record with neither is reported through
+`OnError` and not committed. The order is produce, then commit, then resume, so delivery is at-least-once, and a
+failed produce is retried after `RetryDelay` without committing. A record being held lives in memory only (the
+partition is paused, not committed), so a restart re-reads it from the last committed offset. Configure the
+producer with `Acks = All`, give the retry topics `message.timestamp.type=LogAppendTime` (SHOULD) and a retention
+longer than the largest tier.
 
 ## Redrive (DLQ replay)
 

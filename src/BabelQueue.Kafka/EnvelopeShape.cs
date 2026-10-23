@@ -10,7 +10,7 @@ namespace BabelQueue.Kafka;
 /// <list type="bullet">
 /// <item>the body must be exactly one JSON value (no BOM, trailing tokens or malformed numbers); a bare <c>null</c>
 /// decodes to an empty envelope, any other non-object is rejected;</item>
-/// <item><c>job</c>, <c>trace_id</c>, <c>meta.id|queue|lang</c> and <c>dead_letter.reason|error|exception|original_queue|lang</c>
+/// <item><c>trace_id</c>, <c>meta.id|queue|lang</c> and <c>dead_letter.reason|error|exception|original_queue|lang</c>
 /// are string-or-null;</item>
 /// <item><c>meta.schema_version|created_at</c>, <c>attempts</c> and <c>dead_letter.failed_at|attempts</c> are
 /// integer-or-null: an integer literal (no fraction or exponent) that fits int64;</item>
@@ -18,7 +18,10 @@ namespace BabelQueue.Kafka;
 /// doubles;</item>
 /// <item>member names are matched exactly as spelled (case-sensitive, as the contract schema and the core decoder read
 /// them) and every occurrence of a duplicated key is checked; any other member (a differently-cased name or a
-/// non-string <c>urn</c> alias included) is only checked for syntax.</item>
+/// non-string <c>urn</c> alias included) is only checked for syntax;</item>
+/// <item><c>job</c> is deliberately not type-checked (ADR-0032 section 6): a non-string <c>job</c> is ignored, the last
+/// duplicate wins and the identity rule then applies; a body without a valid <c>job</c>/<c>urn</c> identity is not an
+/// undecodable one here, the consumer parks it as poison on its own identity check.</item>
 /// </list>
 /// A well-typed but non-conformant envelope is <b>not</b> poison (Go's consume path never calls <c>Accepts</c>).
 /// </summary>
@@ -41,7 +44,7 @@ internal static class EnvelopeShape
 
     private static readonly Dictionary<string, Kind> Top = new(StringComparer.Ordinal)
     {
-        ["job"] = Kind.String, ["trace_id"] = Kind.String, ["attempts"] = Kind.Integer,
+        ["trace_id"] = Kind.String, ["attempts"] = Kind.Integer,
         ["data"] = Kind.Data, ["meta"] = Kind.Object, ["dead_letter"] = Kind.Object,
     };
 

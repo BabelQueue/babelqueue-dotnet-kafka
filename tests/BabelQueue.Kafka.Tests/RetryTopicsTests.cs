@@ -59,4 +59,30 @@ public sealed class RetryTopicsTests
         Assert.Null(RetryTopics.ForTopic("orders").WithoutDlq().Build().DlqTopic);
         Assert.Equal("orders-dead", RetryTopics.ForTopic("orders").DlqTopic("orders-dead").Build().DlqTopic);
     }
+
+    [Fact]
+    public void RecommendedTiersAreAnExplicitOptIn()
+    {
+        Assert.Equal(new[] { 5_000, 30_000, 300_000, 1_800_000 }, RetryTopics.RecommendedTierMillis);
+
+        var rt = RetryTopics.ForTopic("orders").RecommendedTiers().Build();
+        Assert.Equal(4, rt.Tiers.Count);
+        Assert.Equal(TimeSpan.FromSeconds(5), rt.Tiers[0].Delay);
+        Assert.Equal(TimeSpan.FromMinutes(30), rt.Tiers[3].Delay);
+        Assert.Equal("orders.retry.4", rt.Tiers[3].Topic);
+
+        // The default topology is unchanged: no tiers unless asked for.
+        Assert.False(RetryTopics.ForTopic("orders").Build().HasTiers);
+    }
+
+    [Fact]
+    public void TierForDelayNeverClampsDownToTheLargestTier()
+    {
+        // Delay publish (ADR-0034 §3): smallest tier >= delay, an over-large delay raises — it is not clamped.
+        var rt = RetryTopics.ForTopic("orders").RecommendedTiers().Build();
+        Assert.Equal("orders.retry.4", rt.TierForDelay(TimeSpan.FromMinutes(30)).Topic);
+        Assert.Throws<BabelQueueException>(() => rt.TierForDelay(TimeSpan.FromMinutes(30) + TimeSpan.FromMilliseconds(1)));
+        // ...while the retry rule does clamp: attempts beyond the tier count stay on the last tier.
+        Assert.Equal("orders.retry.4", rt.TierForAttempt(100).Topic);
+    }
 }

@@ -15,9 +15,12 @@ using Xunit;
 namespace BabelQueue.Kafka.Tests;
 
 /// <summary>
-/// The poison trigger set is Go's: a body is poison exactly when <c>babelqueue.Decode</c> (typed
-/// <c>Envelope</c>/<c>Meta</c>/<c>DeadLetter</c>) rejects it. <c>poison-trigger-set.json</c> holds the bodies and the
-/// verdicts produced by running <c>babelqueue.Decode</c> itself; the same table is checked in every SDK.
+/// The vendored conformance <c>kafka_poison</c> section (ADR-0034 section 10, ADR-0032 section 6) replaces the old
+/// <c>poison-trigger-set.json</c> table. Every case is classified with the core decoder (<c>ok</c>: parses and carries a
+/// valid identity; <c>no_identity</c>: parses but has none; <c>poison</c>: cannot be decoded) and its fate is then checked
+/// through the transport: <c>ok</c> reaches the handler, <c>no_identity</c> and <c>poison</c> both go to
+/// <c>&lt;topic&gt;.dlq</c> with <c>reason: poison</c> without calling it. The section also pins that
+/// <c>System.Text.Json</c>-based decoding takes the LAST duplicate top-level key.
 /// </summary>
 public sealed class PoisonTriggerSetTests
 {
@@ -25,25 +28,57 @@ public sealed class PoisonTriggerSetTests
 
     public static IEnumerable<object[]> Rows()
     {
-        using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "poison-trigger-set.json")));
-        foreach (var row in doc.RootElement.EnumerateArray())
+        using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "conformance", "manifest.json")));
+        foreach (var row in doc.RootElement.GetProperty("kafka_poison").GetProperty("cases").EnumerateArray())
         {
-            yield return new object[] { row.GetProperty("name").GetString()!, row.GetProperty("body").GetString()!, row.GetProperty("poison").GetBoolean() };
+            yield return new object[] { row.GetProperty("name").GetString()!, row.GetProperty("body").GetString()!, row.GetProperty("expect").GetString()! };
+        }
+    }
+
+    /// <summary>The verdict of the core decoder (the runner's classification of a case).</summary>
+    private static (string Verdict, string Identity) Classify(string body)
+    {
+        if (KafkaConsumer.DecodeFailure(body) is not null)
+        {
+            return ("poison", "");
+        }
+        try
+        {
+            var identity = EnvelopeCodec.Urn(EnvelopeCodec.Decode(body));
+            return (identity.Length == 0 ? "no_identity" : "ok", identity);
+        }
+        catch (Exception)
+        {
+            return ("poison", "");
         }
     }
 
     [Fact]
-    public void TheTableIsNotEmpty() => Assert.True(Rows().Count() > 50);
+    public void TheSectionIsVendoredAndCoversAllThreeVerdicts()
+    {
+        var rows = Rows().ToList();
+        Assert.True(rows.Count >= 92, $"expected at least 92 cases, got {rows.Count}");
+        Assert.Equal(new[] { "no_identity", "ok", "poison" }, rows.Select(r => (string)r[2]).Distinct().OrderBy(x => x, StringComparer.Ordinal));
+    }
 
     [Theory]
     [MemberData(nameof(Rows))]
-    public void TheShapeCheckMatchesGo(string name, string body, bool poison)
+    public void TheCoreDecoderClassifiesEveryCase(string name, string body, string expect)
     {
-        Assert.True(poison == (KafkaConsumer.DecodeFailure(body) is not null), $"{name}: Go poison={poison}");
+        Assert.True(expect == Classify(body).Verdict, $"{name}: expected {expect}, got {Classify(body).Verdict}");
+    }
+
+    [Fact]
+    public void ADuplicateTopLevelKeyTakesTheLastValue()
+    {
+        // System.Text.Json (the core decoder) keeps the last duplicate, so the identity rule runs on the last value.
+        Assert.Equal(("ok", "urn:x"), Classify("{\"job\":5,\"job\":\"urn:x\"}"));
+        Assert.Equal(("no_identity", ""), Classify("{\"job\":\"urn:x\",\"job\":5}"));
+        Assert.Equal(("ok", "urn:y"), Classify("{\"job\":\"urn:x\",\"job\":\"urn:y\"}"));
     }
 
     private static async Task<(List<(string Topic, Message<byte[], byte[]> Message)> Sent, Mock<IConsumer<byte[], byte[]>> Consumer, int Reported, int Handled)> Run(
-        string body, string unknownUrn = UnknownUrnStrategy.Delete, bool withHandler = false, bool jobHeader = false, List<Envelope>? received = null)
+        string body, string unknownUrn = UnknownUrnStrategy.Delete, bool withHandler = false, bool jobHeader = false, List<Envelope>? received = null, string handlerUrn = Urn)
     {
         var result = new ConsumeResult<byte[], byte[]>
         {
@@ -69,7 +104,7 @@ public sealed class PoisonTriggerSetTests
         var handlers = new Dictionary<string, BabelHandler>();
         if (withHandler)
         {
-            handlers[Urn] = (envelope, _, _) => { handled++; received?.Add(envelope); return Task.CompletedTask; };
+            handlers[handlerUrn] = (envelope, _, _) => { handled++; received?.Add(envelope); return Task.CompletedTask; };
         }
 
         await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
@@ -83,24 +118,26 @@ public sealed class PoisonTriggerSetTests
     }
 
     [Fact]
-    public async Task TheConsumerDeadLettersExactlyThePoisonRowsAndNothingElse()
+    public async Task TheConsumerSettlesEveryCaseWithTheFateItsVerdictDemands()
     {
         var failures = new List<string>();
         foreach (var row in Rows())
         {
-            var (name, body, poison) = ((string)row[0], (string)row[1], (bool)row[2]);
-            var (sent, consumer, reported, _) = await Run(body);
-            consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
-            consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
-            if (poison)
+            var (name, body, expect) = ((string)row[0], (string)row[1], (string)row[2]);
+            var identity = Classify(body).Identity;
+            foreach (var strategy in new[] { UnknownUrnStrategy.Delete, UnknownUrnStrategy.DeadLetter, UnknownUrnStrategy.Fail })
             {
-                var ok = sent.Count == 1 && sent[0].Topic == "orders.dlq" && reported == 1
+                var (sent, consumer, reported, handled) = await Run(body, strategy, withHandler: true, handlerUrn: identity.Length == 0 ? Urn : identity);
+                consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+                consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
+                if (expect == "ok")
+                {
+                    if (handled != 1 || sent.Count != 0 || reported != 0) { failures.Add($"{name} [{strategy}] (expected the handler, no DLQ record)"); }
+                    continue;
+                }
+                var parked = sent.Count == 1 && sent[0].Topic == "orders.dlq" && reported == 1 && handled == 0
                     && JsonDocument.Parse(sent[0].Message.Value).RootElement.GetProperty("dead_letter").GetProperty("reason").GetString() == "poison";
-                if (!ok) { failures.Add(name + " (expected a poison DLQ record)"); }
-            }
-            else if (sent.Count != 0 || reported != 0)
-            {
-                failures.Add(name + " (expected no DLQ record)");
+                if (!parked) { failures.Add($"{name} [{strategy}] (expected a poison DLQ record, no handler)"); }
             }
         }
         Assert.True(failures.Count == 0, string.Join("; ", failures));
@@ -124,13 +161,27 @@ public sealed class PoisonTriggerSetTests
     [InlineData("{}")]
     [InlineData("null")]
     [InlineData("{\"job\":null}")]
-    public async Task AnEmptyJobOrABareNullTakesTheUnknownUrnPathNotThePoisonPath(string body)
+    [InlineData("{\"job\":5}")]
+    public async Task ABodyWithNoIdentityIsPoisonOnEveryUnknownUrnStrategy(string body)
     {
-        var (sent, _, _, _) = await Run(body, UnknownUrnStrategy.DeadLetter);
-        var record = Assert.Single(sent);
-        var value = JsonDocument.Parse(record.Message.Value).RootElement;
-        Assert.Equal("unknown_urn", value.GetProperty("dead_letter").GetProperty("reason").GetString());
-        Assert.False(value.TryGetProperty("raw", out _));
+        // ADR-0034 section 10: no job/urn identity has the fate of an undecodable body, whatever the unknown-URN strategy.
+        foreach (var strategy in new[] { UnknownUrnStrategy.Delete, UnknownUrnStrategy.DeadLetter, UnknownUrnStrategy.Release, UnknownUrnStrategy.Fail })
+        {
+            var (sent, consumer, _, handled) = await Run(body, strategy, withHandler: true);
+            var record = Assert.Single(sent);
+            Assert.Equal("orders.dlq", record.Topic);
+            Assert.Equal("poison", JsonDocument.Parse(record.Message.Value).RootElement.GetProperty("dead_letter").GetProperty("reason").GetString());
+            Assert.Equal(0, handled);
+            consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+        }
+    }
+
+    [Fact]
+    public async Task TheBqJobHeaderStillSuppliesTheIdentityOfABodyWithoutOne()
+    {
+        var (sent, _, _, handled) = await Run("{}", withHandler: true, jobHeader: true);
+        Assert.Equal(1, handled);
+        Assert.Empty(sent);
     }
 
     [Theory]
@@ -213,9 +264,10 @@ public sealed class PoisonTriggerSetTests
     }
 
     [Fact]
-    public void ANonStringUrnAliasIsIgnoredNotPoison()
+    public void ANonStringJobOrUrnIsIgnoredNotATypeError()
     {
         Assert.Null(KafkaConsumer.DecodeFailure("{\"urn\":5}"));
-        Assert.NotNull(KafkaConsumer.DecodeFailure("{\"job\":5}"));
+        Assert.Null(KafkaConsumer.DecodeFailure("{\"job\":5}"));
+        Assert.Equal(("no_identity", ""), Classify("{\"job\":5}"));
     }
 }

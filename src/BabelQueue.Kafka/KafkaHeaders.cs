@@ -21,6 +21,11 @@ internal static class KafkaHeaders
     public const string Delay = "bq-delay";
     public const string OriginalTopic = "bq-original-topic";
 
+    /// <summary>W3C trace-context headers, carried out of band (ADR-0028); never part of the envelope.</summary>
+    public const string Traceparent = "traceparent";
+
+    public const string Tracestate = "tracestate";
+
     /// <summary>The mandatory <c>bq-</c> header set projected from the envelope (Contract §6.3).</summary>
     public static Headers Project(Envelope envelope)
     {
@@ -39,6 +44,26 @@ internal static class KafkaHeaders
         }
         headers.Add(Attempts, Bytes(envelope.Attempts.ToString(CultureInfo.InvariantCulture)));
         return headers;
+    }
+
+    /// <summary>
+    /// Copies the W3C <c>traceparent</c> / <c>tracestate</c> headers of a consumed record onto the record that is
+    /// republished for it (retry tier, DLQ), so the trace survives the hop (ADR-0028). Headers that are absent
+    /// are not invented; the <c>bq-</c> projection is unaffected.
+    /// </summary>
+    public static void CarryTrace(Headers target, Headers? source)
+    {
+        if (source is null)
+        {
+            return;
+        }
+        foreach (var name in new[] { Traceparent, Tracestate })
+        {
+            if (source.TryGetLastBytes(name, out var bytes))
+            {
+                target.Add(name, bytes);
+            }
+        }
     }
 
     public static void Add(Headers headers, string key, string value) => headers.Add(key, Bytes(value));

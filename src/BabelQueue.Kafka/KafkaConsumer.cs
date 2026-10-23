@@ -172,6 +172,18 @@ public sealed class KafkaConsumer
         }
 
         var urn = KafkaHeaders.GetString(headers, KafkaHeaders.Job) ?? EnvelopeCodec.Urn(envelope);
+        if (urn.Length == 0)
+        {
+            // ADR-0034 §10 / ADR-0032 §6: a body with no valid job/urn identity (and no bq-job header) has the same fate
+            // as an undecodable one on Kafka: parked in <topic>.dlq with reason "poison", the handler is never called.
+            await SettlePoisonAsync(
+                result,
+                body!,
+                new BabelQueueException("Undecodable BabelQueue body: neither 'job' nor 'urn' is a valid identity."),
+                EmptyEnvelope(),
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
         if (!_handlers.TryGetValue(urn, out var handler))
         {
             await OnUnknownUrnAsync(result, envelope, urn, cancellationToken).ConfigureAwait(false);
@@ -368,6 +380,7 @@ public sealed class KafkaConsumer
         var headers = KafkaHeaders.Project(bumped);
         KafkaHeaders.Add(headers, KafkaHeaders.Delay, ((long)tier.Delay.TotalMilliseconds).ToString(System.Globalization.CultureInfo.InvariantCulture));
         KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, OriginalTopic(result));
+        KafkaHeaders.CarryTrace(headers, result.Message.Headers);
         await ProduceAsync(tier.Topic, result.Message.Key, bumped, headers, cancellationToken).ConfigureAwait(false);
     }
 
@@ -382,6 +395,7 @@ public sealed class KafkaConsumer
         var annotated = DeadLetters.Annotate(envelope, reason, original, envelope.Attempts, error?.Message, error?.GetType().FullName);
         var headers = KafkaHeaders.Project(annotated);
         KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, original);
+        KafkaHeaders.CarryTrace(headers, result.Message.Headers);
         await ProduceAsync(dlq, result.Message.Key, annotated, headers, cancellationToken).ConfigureAwait(false);
     }
 
@@ -516,6 +530,7 @@ public sealed class KafkaConsumer
             headers = new Headers();
         }
         KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, original);
+        KafkaHeaders.CarryTrace(headers, result.Message.Headers);
         var message = new Message<byte[], byte[]>
         {
             Key = result.Message.Key,

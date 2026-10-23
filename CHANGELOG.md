@@ -9,8 +9,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- `KafkaReinjectConsumer` / `KafkaReinjectOptions`: the ADR-0034 §5-§7 re-inject loop. It pauses a retry-tier partition until `timestamp + tier_ms` (A6 clamp to `[now, now + tier_ms]`), then re-produces the record byte-for-byte to the original topic (dropping only `bq-delay` and `bq-original-topic`, keeping `traceparent`), commits, and resumes (at-least-once). A failed produce is not committed and is retried after `RetryDelay`.
+- `RetryTopics.RecommendedTierMillis` and `RetryTopics.Builder.RecommendedTiers()`: explicit opt-in to the ADR-0034 §2 ladder (5 s, 30 s, 5 min, 30 min).
+
+- Conformance `results.json` (ADR-0032): the test project runs the `backoff`, `kafka` and `kafka_poison` manifest sections and writes `results.json` to `BQ_CONFORMANCE_RESULTS`; `ci.yml` uploads it as an artifact and `release.yml` attaches it to the GitHub release.
+- `KafkaHeaders.CarryTrace`: `traceparent` / `tracestate` of the consumed record are now carried onto the retry-topic republish, the DLQ record and the poison DLQ record (ADR-0028), so the re-inject loop forwards the original trace to the work topic. Nothing is invented when the source record has no trace headers.
+
 ### Changed
 
+- **Behaviour change:** a body with no identity (`job` absent, blank or not a string, no `urn` alias) **and** no `bq-job` header is now dead-lettered as poison (`reason: "poison"`, handler not called) instead of taking the unknown-URN path (ADR-0034 §10). `job` is no longer type-checked by the strict decode (a non-string `job` is ignored, a blank one falls back to `urn`, ADR-0032 §6).
+- The local `poison-trigger-set.json` is removed; `PoisonTriggerSetTests` now runs the vendored conformance `kafka_poison` section (92 cases).
+- Vendored conformance suite updated to v1.6.0; `fetch.sh` is pinned by sha256 (`BQ_FETCH_SH_SHA256`) in every curl-using workflow.
+- Tests: a failure whose attempts are at or above the tier count lands in the last tier; `TierForDelay` never clamps down to the largest tier.
 - Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.
 
 ## [1.2.0] - 2026-10-12
