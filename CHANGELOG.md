@@ -11,7 +11,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Added
 
-- `KafkaReinjectConsumer` / `KafkaReinjectOptions`: the ADR-0034 §5-§7 re-inject loop. It pauses a retry-tier partition until `timestamp + tier_ms` (A6 clamp to `[now, now + tier_ms]`), then re-produces the record byte-for-byte to the original topic (dropping only `bq-delay` and `bq-original-topic`, keeping `traceparent`), commits, and resumes (at-least-once). A failed produce is not committed and is retried after `RetryDelay`.
+- `KafkaReinjectConsumer` / `KafkaReinjectOptions`: the ADR-0034 §5-§7 re-inject loop. It pauses a retry-tier partition until `timestamp + tier_ms` (clamp to `[now, now + tier_ms]`), then re-produces the record byte-for-byte to the original topic (dropping only `bq-delay` and `bq-original-topic`, keeping `traceparent`), commits, and resumes (at-least-once). A failed produce is not committed and is retried after `RetryDelay`.
 - `RetryTopics.RecommendedTierMillis` and `RetryTopics.Builder.RecommendedTiers()`: explicit opt-in to the ADR-0034 §2 ladder (5 s, 30 s, 5 min, 30 min).
 
 - Conformance `results.json` (ADR-0032): the test project runs the `backoff`, `kafka` and `kafka_poison` manifest sections and writes `results.json` to `BQ_CONFORMANCE_RESULTS`; `ci.yml` uploads it as an artifact and `release.yml` attaches it to the GitHub release.
