@@ -289,20 +289,52 @@ public sealed class KafkaConsumerTests
     }
 
     [Fact]
-    public async Task PoisonJsonObjectKeepsItsKeysAndReplacesAnExistingDeadLetter()
+    public async Task PoisonJsonObjectIsSplicedByteForByte()
     {
-        // data is a list (not an object): the decoder rejects it, so it is poison; its keys are kept verbatim
-        // (the number is not reformatted) and the stale dead_letter is overridden.
-        var body = "{\"job\":\"urn:babel:orders:created\",\"data\":[1],\"price\":1.50,\"dead_letter\":{\"reason\":\"failed\"}}";
+        // data is a list (not an object): the decoder rejects it, so it is poison; the original bytes are kept
+        // (the number is not reformatted, a number beyond double range stays as written) and dead_letter is appended.
+        var body = "{\"job\":\"urn:babel:orders:created\",\"data\":[1],\"price\":1.50,\"big\":1e400}";
+        var (dlq, _, _) = await RunPoison(Encoding.UTF8.GetBytes(body));
+
+        var text = Encoding.UTF8.GetString(dlq.Value);
+        Assert.StartsWith(body[..^1] + ",\"dead_letter\":{", text, StringComparison.Ordinal);
+        var value = ParseValue(dlq);
+        Assert.False(value.TryGetProperty("raw", out _));
+        Assert.False(value.TryGetProperty("raw_encoding", out _));
+        Assert.Equal("urn:babel:orders:created", value.GetProperty("job").GetString());
+        Assert.Contains("\"price\":1.50", text, StringComparison.Ordinal);
+        Assert.Equal("poison", value.GetProperty("dead_letter").GetProperty("reason").GetString());
+        Assert.Equal("urn:babel:orders:created", KafkaHeaders.GetString(dlq.Headers, KafkaHeaders.Job));
+    }
+
+    [Fact]
+    public async Task PoisonJsonObjectThatAlreadyHasADeadLetterIsWrapped()
+    {
+        var body = "{\"job\":\"urn:babel:orders:created\",\"data\":[1],\"dead_letter\":{\"reason\":\"failed\"}}";
         var (dlq, _, _) = await RunPoison(Encoding.UTF8.GetBytes(body));
 
         var value = ParseValue(dlq);
-        Assert.False(value.TryGetProperty("raw", out _));
-        Assert.Equal("urn:babel:orders:created", value.GetProperty("job").GetString());
-        Assert.Equal(System.Text.Json.JsonValueKind.Array, value.GetProperty("data").ValueKind);
-        Assert.Contains("\"price\":1.50", Encoding.UTF8.GetString(dlq.Value));
+        Assert.Equal(body, value.GetProperty("raw").GetString());
+        Assert.False(value.TryGetProperty("raw_encoding", out _));
         Assert.Equal("poison", value.GetProperty("dead_letter").GetProperty("reason").GetString());
-        Assert.Equal("urn:babel:orders:created", KafkaHeaders.GetString(dlq.Headers, KafkaHeaders.Job));
+    }
+
+    [Fact]
+    public void PoisonBodyOfAnEmptyObjectHasOnlyTheDeadLetterMember()
+    {
+        var record = Encoding.UTF8.GetString(KafkaConsumer.PoisonBody(Encoding.UTF8.GetBytes(" { } "), "e", null, 1, "orders", 0));
+
+        Assert.StartsWith("{\"dead_letter\":{\"reason\":\"poison\"", record, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PoisonBodyOfInvalidUtf8IsBase64WithRawEncoding()
+    {
+        var body = new byte[] { 0xFF, 0xFE, 0x41 };
+        using var doc = System.Text.Json.JsonDocument.Parse(KafkaConsumer.PoisonBody(body, "e", null, 1, "orders", 0));
+
+        Assert.Equal("//5B", doc.RootElement.GetProperty("raw").GetString());
+        Assert.Equal("base64", doc.RootElement.GetProperty("raw_encoding").GetString());
     }
 
     [Theory]
@@ -559,7 +591,7 @@ public sealed class KafkaConsumerTests
     };
 
     [Fact]
-    public async Task InvalidUtf8BodyIsWrappedAsPoisonWithReplacementCharsNotDecoded()
+    public async Task InvalidUtf8BodyIsWrappedAsPoisonAsBase64()
     {
         var body = EnvelopeBytesWithInvalidUtf8();
         Assert.Contains((byte)0xFF, body);
@@ -586,8 +618,10 @@ public sealed class KafkaConsumerTests
         Assert.Equal(Encoding.UTF8.GetBytes("k1"), dlq.Message.Key);
         var value = ParseValue(dlq.Message);
         Assert.Equal("poison", value.GetProperty("dead_letter").GetProperty("reason").GetString());
-        // The bad byte is stored as U+FFFD inside the (still valid) object; the handler never saw it.
-        Assert.Contains("\uFFFD", value.GetProperty("data").GetProperty("order_id").GetString());
+        // ADR-0035: the exact bytes are kept as standard base64 plus raw_encoding; U+FFFD never appears.
+        Assert.Equal("base64", value.GetProperty("raw_encoding").GetString());
+        Assert.Equal(body, Convert.FromBase64String(value.GetProperty("raw").GetString()!));
+        Assert.DoesNotContain("\uFFFD", Encoding.UTF8.GetString(dlq.Message.Value), StringComparison.Ordinal);
         consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
     }
 

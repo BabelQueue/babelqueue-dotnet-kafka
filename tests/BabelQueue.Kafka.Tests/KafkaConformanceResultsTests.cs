@@ -25,7 +25,7 @@ public sealed class KafkaConformanceResultsTests
         Assert.Equal(KafkaConformanceSuite.ConformanceVersion, root.GetProperty("conformance_version").GetString());
 
         var sections = root.GetProperty("sections");
-        Assert.Equal(new[] { "backoff", "kafka", "kafka_poison" }, sections.EnumerateObject().Select(s => s.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray());
+        Assert.Equal(new[] { "backoff", "kafka", "kafka_poison", "poison_dlq" }, sections.EnumerateObject().Select(s => s.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray());
 
         var failures = new List<string>();
         foreach (var section in sections.EnumerateObject())
@@ -46,7 +46,7 @@ public sealed class KafkaConformanceResultsTests
     public void EveryInScopeSectionIsEnumeratedWithUniqueIds()
     {
         var cases = KafkaConformanceSuite.All();
-        Assert.Equal(new[] { "backoff", "kafka", "kafka_poison" }, KafkaConformanceSuite.Sections().OrderBy(s => s, StringComparer.Ordinal).ToArray());
+        Assert.Equal(new[] { "backoff", "kafka", "kafka_poison", "poison_dlq" }, KafkaConformanceSuite.Sections().OrderBy(s => s, StringComparer.Ordinal).ToArray());
         Assert.Equal(cases.Count, cases.Select(c => (c.Section, c.Id)).Distinct().Count());
         Assert.Contains(cases, c => c is { Section: "kafka", Id: "property_projection" });
         Assert.Contains(cases, c => c is { Section: "kafka", Id: "schema_version_gate/0" });
@@ -54,5 +54,7 @@ public sealed class KafkaConformanceResultsTests
         Assert.Contains(cases, c => c is { Section: "backoff", Id: "retry_attempt_tier/key-forwarded-byte-for-byte" });
         Assert.Contains(cases, c => c is { Section: "backoff", Id: "default_tiers/recommended-tier-list" });
         Assert.True(cases.Count(c => c.Section == "kafka_poison") >= 92);
+        Assert.Equal(43, cases.Count(c => c.Section == "poison_dlq"));
+        Assert.Contains(cases, c => c is { Section: "poison_dlq", Id: "invalid-utf8-one-byte-two-pad" });
     }
 }

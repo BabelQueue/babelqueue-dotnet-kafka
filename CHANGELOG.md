@@ -19,8 +19,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Changed
 
+- Internal `PoisonRecord` copy: the `dead_letter` argument is now validated as a single JSON object and rejected otherwise. KEEP IN SYNC with `BabelQueue.Core`.
 - **Behaviour change:** a body with no identity (`job` absent, blank or not a string, no `urn` alias) **and** no `bq-job` header is now dead-lettered as poison (`reason: "poison"`, handler not called) instead of taking the unknown-URN path (ADR-0034 §10). `job` is no longer type-checked by the strict decode (a non-string `job` is ignored, a blank one falls back to `urn`, ADR-0032 §6).
 - The local `poison-trigger-set.json` is removed; `PoisonTriggerSetTests` now runs the vendored conformance `kafka_poison` section (92 cases).
+- Poison DLQ record shape follows ADR-0035: a strict JSON object body is spliced byte-for-byte, any other body is wrapped as `{"raw", "raw_encoding"?, "dead_letter"}` and an invalid-UTF-8 body is stored as standard base64 with `"raw_encoding": "base64"` (no U+FFFD substitution). The conformance runner now also runs the `poison_dlq` section.
 - Vendored conformance suite updated to v1.6.0; `fetch.sh` is pinned by sha256 (`BQ_FETCH_SH_SHA256`) in every curl-using workflow.
 - Tests: a failure whose attempts are at or above the tier count lands in the last tier; `TierForDelay` never clamps down to the largest tier.
 - Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.

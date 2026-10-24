@@ -26,7 +26,7 @@ internal sealed class ConformanceFailure : Exception
 
 /// <summary>
 /// Every case of the Kafka-scoped sections of the vendored conformance manifest (<c>kafka</c>, <c>backoff</c>,
-/// <c>kafka_poison</c>), each runnable on its own, plus the <c>results.json</c> writer of ADR-0032. Case ids follow
+/// <c>kafka_poison</c>, plus the core-scoped <c>poison_dlq</c> whose writer lives here), each runnable on its own, plus the <c>results.json</c> writer of ADR-0032. Case ids follow
 /// <c>conformance/schema/results.schema.json</c>: a top-level <c>cases</c> array gives <c>&lt;name&gt;</c> (or
 /// <c>&lt;section&gt;#&lt;idx&gt;</c>), a sub-key with its own <c>cases</c> gives <c>&lt;sub-key&gt;/&lt;name&gt;</c> (or
 /// <c>&lt;sub-key&gt;/&lt;idx&gt;</c>), any other object sub-key is one case named after it. A case with no runner here is
@@ -35,6 +35,8 @@ internal sealed class ConformanceFailure : Exception
 internal static class KafkaConformanceSuite
 {
     private const string Urn = "urn:babel:orders:created";
+    // Scope "core" in the manifest, but the writer of the poison DLQ record (ADR-0035) is this package's consumer.
+    private const string PoisonDlqSection = "poison_dlq";
     private static readonly string Dir = Path.Combine(AppContext.BaseDirectory, "conformance");
 
     private static readonly Lazy<JsonElement> Manifest = new(() =>
@@ -48,7 +50,7 @@ internal static class KafkaConformanceSuite
     /// <summary>The manifest sections whose declared scope is <c>kafka</c> (the in-scope sections of this package).</summary>
     internal static IReadOnlyList<string> Sections() =>
         Manifest.Value.GetProperty("sections").EnumerateObject()
-            .Where(s => s.Value.GetProperty("scope").GetString() == "kafka")
+            .Where(s => s.Value.GetProperty("scope").GetString() == "kafka" || s.Name == PoisonDlqSection)
             .Select(s => s.Name)
             .ToList();
 
@@ -112,6 +114,7 @@ internal static class KafkaConformanceSuite
             ("backoff", "topic_names") => () => TopicNames(c),
             ("backoff", "default_tiers") => () => DefaultTiers(c),
             ("kafka_poison", null) => () => Poison(c),
+            ("poison_dlq", null) => () => PoisonDlq(c),
             _ => null,
         };
         return new SuiteCase(section, id, run ?? (() => throw new ConformanceFailure($"no runner for {section}/{id}")));
@@ -330,6 +333,77 @@ internal static class KafkaConformanceSuite
         {
             return ("poison", "");
         }
+    }
+
+    // -- poison_dlq (ADR-0035) --------------------------------------------------------------------------------------
+
+    private static readonly JsonDocumentOptions DeepJson = new() { MaxDepth = 10_100 };
+
+    private static Task PoisonDlq(JsonElement testCase)
+    {
+        var bytes = testCase.TryGetProperty("body_base64", out var b64)
+            ? Convert.FromBase64String(b64.GetString()!)
+            : Encoding.UTF8.GetBytes(testCase.GetProperty("body").GetString()!);
+        var originalQueue = Manifest.Value.GetProperty(PoisonDlqSection).GetProperty("original_queue").GetString()!;
+        var expect = testCase.GetProperty("expect");
+        var shape = expect.GetProperty("shape").GetString()!;
+
+        var record = KafkaConsumer.PoisonBody(bytes, "poison", "System.Exception", 1700000000000L, originalQueue, 0);
+        var text = Encoding.UTF8.GetString(record);
+        Require(!text.Contains('\uFFFD', StringComparison.Ordinal), "the record holds U+FFFD");
+
+        using var doc = JsonDocument.Parse(record, DeepJson);
+        Require(doc.RootElement.ValueKind == JsonValueKind.Object, "the record is not a JSON object");
+        var deadLetter = doc.RootElement.EnumerateObject().Where(p => p.Name == "dead_letter").ToList();
+        Require(deadLetter.Count == 1, "the record must carry exactly one top-level dead_letter");
+        Require(
+            deadLetter[0].Value.GetProperty("reason").GetString() == "poison"
+            && deadLetter[0].Value.GetProperty("original_queue").GetString() == originalQueue,
+            "dead_letter must have reason poison and the original queue");
+        var withoutDeadLetter = doc.RootElement.EnumerateObject().Where(p => p.Name != "dead_letter").ToList();
+
+        var want = expect.GetProperty("record");
+        if (shape == "splice_or_wrapper" && !SameMembers(withoutDeadLetter, want))
+        {
+            foreach (var literal in expect.GetProperty("splice_literals").EnumerateArray())
+            {
+                Require(text.Contains(literal.GetString()!, StringComparison.Ordinal), $"the record does not contain {literal.GetString()} verbatim");
+            }
+
+            Require(!withoutDeadLetter.Any(p => p.Name is "raw" or "raw_encoding"), "a spliced record has a top-level raw / raw_encoding member");
+            var keys = withoutDeadLetter.Select(p => p.Name).Distinct(StringComparer.Ordinal).OrderBy(n => n, StringComparer.Ordinal).ToList();
+            var wantKeys = expect.GetProperty("splice_keys").EnumerateArray().Select(k => k.GetString()!).OrderBy(n => n, StringComparer.Ordinal).ToList();
+            Require(keys.SequenceEqual(wantKeys), $"top-level members {string.Join(",", keys)}, expected {string.Join(",", wantKeys)}");
+            return Task.CompletedTask;
+        }
+
+        Require(SameMembers(withoutDeadLetter, want), $"the record without dead_letter differs from the expected record: {text}");
+        return Task.CompletedTask;
+    }
+
+    private static bool SameMembers(List<JsonProperty> members, JsonElement want)
+    {
+        var wantMembers = want.EnumerateObject().ToList();
+        return members.Count == wantMembers.Count
+            && members.All(m => wantMembers.Count(w => w.Name == m.Name && SameJson(m.Value, w.Value)) == 1);
+    }
+
+    private static bool SameJson(JsonElement a, JsonElement b)
+    {
+        if (a.ValueKind != b.ValueKind)
+        {
+            return false;
+        }
+
+        return a.ValueKind switch
+        {
+            JsonValueKind.Object => SameMembers(a.EnumerateObject().ToList(), b),
+            JsonValueKind.Array => a.GetArrayLength() == b.GetArrayLength()
+                && a.EnumerateArray().Zip(b.EnumerateArray(), SameJson).All(x => x),
+            JsonValueKind.String => a.GetString() == b.GetString(),
+            JsonValueKind.Number => a.GetRawText() == b.GetRawText(),
+            _ => true,
+        };
     }
 
     // -- helpers ----------------------------------------------------------------------------------------------------
