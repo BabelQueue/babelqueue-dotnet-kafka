@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-24
+
 ### Added
 
 - `KafkaReinjectConsumer` / `KafkaReinjectOptions`: the ADR-0034 §5-§7 re-inject loop. It pauses a retry-tier partition until `timestamp + tier_ms` (clamp to `[now, now + tier_ms]`), then re-produces the record byte-for-byte to the original topic (dropping only `bq-delay` and `bq-original-topic`, keeping `traceparent`), commits, and resumes (at-least-once). A failed produce is not committed and is retried after `RetryDelay`.
