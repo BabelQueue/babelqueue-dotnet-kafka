@@ -1080,4 +1080,297 @@ public sealed class KafkaConsumerTests
         await new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>()).RunAsync(cts.Token);
         consumer.Verify(c => c.Consume(It.IsAny<TimeSpan>()), Times.Never);
     }
+
+    // ---- Dead-letter observer (ADR-0039 section 5.1-5.3) ----
+
+    private sealed class RecordingObserver : IDeadLetterObserver
+    {
+        public List<DeadLetterEvent> Events { get; } = new();
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent) => Events.Add(deadLetterEvent);
+    }
+
+    private sealed class ThrowingObserver : IDeadLetterObserver
+    {
+        public int Calls { get; private set; }
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent)
+        {
+            Calls++;
+            throw new InvalidOperationException("observer exploded");
+        }
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceWhenRetriesAreExhausted()
+    {
+        var observer = new RecordingObserver();
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await new KafkaConsumer(ConsumerWith(ResultFor(Envelope(2))).Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            MaxTries = 3,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal("orders.dlq", Assert.Single(captured).Topic);
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "failed"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAnUnknownUrnSentToTheDlq()
+    {
+        var observer = new RecordingObserver();
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+
+        await new KafkaConsumer(ConsumerWith(ResultFor(Envelope(0))).Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            UnknownUrn = UnknownUrnStrategy.DeadLetter,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Single(captured);
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "unknown_urn"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAPoisonBody()
+    {
+        var observer = new RecordingObserver();
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var result = ResultWithBody(Encoding.UTF8.GetBytes("not-json"));
+
+        await new KafkaConsumer(ConsumerWith(result).Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Single(captured);
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAVersionGatedRawBodyWithAnEmptyReason()
+    {
+        var observer = new RecordingObserver();
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var result = ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), "2");
+
+        await new KafkaConsumer(ConsumerWith(result).Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Single(captured);
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", string.Empty), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverQueueFollowsTheOriginalTopicHeaderForAPoisonBodyFromARetryTier()
+    {
+        var observer = new RecordingObserver();
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var headers = new Headers();
+        headers.Add(KafkaHeaders.OriginalTopic, Encoding.UTF8.GetBytes("orders"));
+        var result = new ConsumeResult<byte[], byte[]>
+        {
+            Topic = "orders.retry.1",
+            Partition = new Partition(0),
+            Offset = new Offset(3),
+            Message = new Message<byte[], byte[]> { Value = Encoding.UTF8.GetBytes("not-json"), Headers = headers },
+        };
+
+        await new KafkaConsumer(ConsumerWith(result).Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("orders", "orders.dlq", "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverQueueIsMetaQueueNotTheConsumedTopicWhenRetriesAreExhausted()
+    {
+        // meta.queue ("billing") differs from the topic the record was consumed from ("orders"): meta.queue wins.
+        var observer = new RecordingObserver();
+        var env = EnvelopeCodec.Make(Urn, new Dictionary<string, object?> { ["order_id"] = 7 }, "billing", "trace-1")
+            with { Attempts = 2 };
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await new KafkaConsumer(ConsumerWith(ResultFor(env)).Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(new List<(string Topic, Message<byte[], byte[]> Message)>()).Object,
+            RetryTopics = Topology(),
+            MaxTries = 3,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("billing", "orders.dlq", "failed"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledForARetryTierRepublish()
+    {
+        var observer = new RecordingObserver();
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await new KafkaConsumer(ConsumerWith(ResultFor(Envelope(0))).Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            MaxTries = 3,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal("orders.retry.1", Assert.Single(captured).Topic);
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenNoDlqIsConfigured()
+    {
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(ResultWithBody(Encoding.UTF8.GetBytes("not-json")));
+
+        await new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Empty(observer.Events);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenTheExhaustedDlqWriteFails()
+    {
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(ResultFor(Envelope(2)));
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        await Assert.ThrowsAsync<ProduceException<byte[], byte[]>>(() =>
+            new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+            {
+                Producer = FailingProducer().Object,
+                RetryTopics = Topology(),
+                MaxTries = 3,
+                DeadLetterObserver = observer,
+            }).PollAsync());
+
+        Assert.Empty(observer.Events);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenThePoisonDlqWriteFails()
+    {
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(ResultWithBody(Encoding.UTF8.GetBytes("not-json")));
+
+        await Assert.ThrowsAsync<ProduceException<byte[], byte[]>>(() =>
+            new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+            {
+                Producer = FailingProducer().Object,
+                RetryTopics = Topology(),
+                DeadLetterObserver = observer,
+            }).PollAsync());
+
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenTheVersionGateRawDlqWriteFails()
+    {
+        var observer = new RecordingObserver();
+        var consumer = ConsumerWith(ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), "2"));
+
+        await new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+        {
+            Producer = FailingProducer().Object,
+            RetryTopics = Topology(),
+            PollTimeout = TimeSpan.FromMilliseconds(1),
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Empty(observer.Events);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AThrowingObserverDoesNotChangeTheExhaustedSettleOutcome()
+    {
+        var observer = new ThrowingObserver();
+        var consumer = ConsumerWith(ResultFor(Envelope(2)));
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, _, _) => throw new InvalidOperationException("boom"),
+        };
+
+        var count = await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(captured).Object,
+            RetryTopics = Topology(),
+            MaxTries = 3,
+            DeadLetterObserver = observer,
+        }).PollAsync();
+
+        Assert.Equal(1, count);
+        Assert.Equal(1, observer.Calls);
+        Assert.Single(captured);
+        consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+        consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AThrowingObserverDoesNotChangeThePoisonOrVersionGateSettleOutcome()
+    {
+        foreach (var result in new[]
+                 {
+                     ResultWithBody(Encoding.UTF8.GetBytes("not-json")),
+                     ResultWithSchemaVersion(EnvelopeCodec.Encode(Envelope(0)), "2"),
+                 })
+        {
+            var observer = new ThrowingObserver();
+            var consumer = ConsumerWith(result);
+            var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+
+            var count = await new KafkaConsumer(consumer.Object, new Dictionary<string, BabelHandler>(), new KafkaConsumerOptions
+            {
+                Producer = Producer(captured).Object,
+                RetryTopics = Topology(),
+                DeadLetterObserver = observer,
+            }).PollAsync();
+
+            Assert.Equal(1, count);
+            Assert.Equal(1, observer.Calls);
+            Assert.Single(captured);
+            consumer.Verify(c => c.Commit(It.IsAny<ConsumeResult<byte[], byte[]>>()), Times.Once);
+            consumer.Verify(c => c.Seek(It.IsAny<TopicPartitionOffset>()), Times.Never);
+        }
+    }
 }
