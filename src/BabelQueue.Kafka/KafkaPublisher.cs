@@ -43,9 +43,33 @@ public sealed class KafkaPublisher
     /// return the message id (<c>meta.id</c>). A positive <paramref name="delay"/> routes to the
     /// matching retry tier (requires a <see cref="RetryTopics"/>); otherwise a delay raises.
     /// </summary>
-    public async Task<string> PublishAsync(
+    public Task<string> PublishAsync(
         string urn,
         IReadOnlyDictionary<string, object?>? data = null,
+        string? traceId = null,
+        TimeSpan? delay = null,
+        CancellationToken cancellationToken = default)
+        => PublishWithHeadersAsync(urn, data, headers: null, traceId, delay, cancellationToken);
+
+    /// <summary>
+    /// The header-aware (ADR-0028) counterpart of
+    /// <see cref="PublishAsync(string, IReadOnlyDictionary{string, object?}?, string?, TimeSpan?, CancellationToken)"/>:
+    /// in addition to the §6 projection it overlays the out-of-band <paramref name="headers"/> (e.g. a W3C
+    /// <c>traceparent</c> from <c>Telemetry.PublishAsync(..., headers, ...)</c>) as UTF-8 record headers. The headers
+    /// ride <b>beside</b> the frozen envelope, never inside it, and never overwrite a <c>bq-</c> contract header; on a
+    /// delayed publish they ride the retry-tier record, so the re-inject loop forwards them to the work topic. A
+    /// <c>null</c>/empty header map is identical to <c>PublishAsync</c>.
+    /// </summary>
+    /// <param name="urn">The message URN to publish.</param>
+    /// <param name="data">The message payload, or <c>null</c> for an empty body.</param>
+    /// <param name="headers">The out-of-band transport headers to ride beside the envelope.</param>
+    /// <param name="traceId">An existing trace id to continue, or <c>null</c> to mint one.</param>
+    /// <param name="delay">A positive delay routes to the matching retry tier (requires a <see cref="RetryTopics"/>).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<string> PublishWithHeadersAsync(
+        string urn,
+        IReadOnlyDictionary<string, object?>? data,
+        IReadOnlyDictionary<string, string>? headers,
         string? traceId = null,
         TimeSpan? delay = null,
         CancellationToken cancellationToken = default)
@@ -58,16 +82,16 @@ public sealed class KafkaPublisher
                 throw new BabelQueueException("Kafka has no native delayed delivery; a delay requires retry topics (none configured).");
             }
             var tier = _retryTopics.TierForDelay(window);
-            await SendAsync(tier.Topic, envelope, window, _workTopic, cancellationToken).ConfigureAwait(false);
+            await SendAsync(tier.Topic, envelope, window, _workTopic, headers, cancellationToken).ConfigureAwait(false);
         }
         else
         {
-            await SendAsync(_workTopic, envelope, null, null, cancellationToken).ConfigureAwait(false);
+            await SendAsync(_workTopic, envelope, null, null, headers, cancellationToken).ConfigureAwait(false);
         }
         return envelope.Meta?.Id ?? string.Empty;
     }
 
-    private async Task SendAsync(string topic, Envelope envelope, TimeSpan? delay, string? originalTopic, CancellationToken cancellationToken)
+    private async Task SendAsync(string topic, Envelope envelope, TimeSpan? delay, string? originalTopic, IReadOnlyDictionary<string, string>? extraHeaders, CancellationToken cancellationToken)
     {
         var headers = KafkaHeaders.Project(envelope);
         if (delay is { } window)
@@ -78,6 +102,7 @@ public sealed class KafkaPublisher
         {
             KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, originalTopic);
         }
+        KafkaHeaders.Merge(headers, extraHeaders);
         var timestamp = envelope.Meta?.CreatedAt ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var message = new Message<byte[], byte[]>
         {

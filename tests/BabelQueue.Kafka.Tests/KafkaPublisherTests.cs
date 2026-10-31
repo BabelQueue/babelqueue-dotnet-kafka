@@ -1,8 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Diagnostics;
+using System.Text.Json;
 using System.Threading;
+using System.Threading.Tasks;
 using BabelQueue;
+using BabelQueue.Tracing;
 using BabelQueue.Kafka;
 using Confluent.Kafka;
 using Moq;
@@ -69,5 +73,201 @@ public sealed class KafkaPublisherTests
         Assert.Equal("orders.retry.2", topic);
         Assert.Equal("30000", KafkaHeaders.GetString(message.Headers, KafkaHeaders.Delay));
         Assert.Equal("orders", KafkaHeaders.GetString(message.Headers, KafkaHeaders.OriginalTopic));
+    }
+
+    // ADR-0028: a W3C traceparent rides as a record header beside the envelope, never inside it.
+    private const string TraceparentValue = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    private const string TracestateValue = "vendor=opaque,other=1";
+
+    private static Dictionary<string, string> TraceHeaders() => new()
+    {
+        ["traceparent"] = TraceparentValue,
+        ["tracestate"] = TracestateValue,
+    };
+
+    private static ConsumeResult<byte[], byte[]> Received(string topic, Message<byte[], byte[]> sent) =>
+        new()
+        {
+            Topic = topic,
+            Partition = new Partition(0),
+            Offset = new Offset(0),
+            Message = sent,
+        };
+
+    private static HashSet<string> TopLevelKeys(byte[] body)
+    {
+        using var doc = JsonDocument.Parse(body);
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in doc.RootElement.EnumerateObject())
+        {
+            keys.Add(property.Name);
+            if (property.Value.ValueKind == JsonValueKind.Object && property.Name == "meta")
+            {
+                foreach (var inner in property.Value.EnumerateObject())
+                {
+                    keys.Add("meta." + inner.Name);
+                }
+            }
+        }
+        return keys;
+    }
+
+    [Fact]
+    public async Task PublishWithHeadersCarriesTraceparentAndLeavesTheBodyAnEnvelope()
+    {
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var publisher = KafkaPublisher.Create(Producer(captured).Object, "orders");
+
+        await publisher.PublishAsync(Urn, new Dictionary<string, object?> { ["order_id"] = 7 }, "trace-1");
+        await publisher.PublishWithHeadersAsync(Urn, new Dictionary<string, object?> { ["order_id"] = 7 }, TraceHeaders(), "trace-1");
+
+        var plain = captured[0].Message;
+        var traced = captured[1].Message;
+
+        // The received record carries the header verbatim (UTF-8).
+        var consumed = Received("orders", traced);
+        Assert.Equal(TraceparentValue, KafkaHeaders.GetString(consumed.Message.Headers, "traceparent"));
+        Assert.Equal(TracestateValue, KafkaHeaders.GetString(consumed.Message.Headers, "tracestate"));
+        Assert.Equal(TraceparentValue, KafkaTraceHeaders.Extract(consumed.Message.Headers)["traceparent"]);
+
+        // The body is the same envelope shape and never mentions the trace header.
+        var body = Encoding.UTF8.GetString(traced.Value);
+        Assert.DoesNotContain("traceparent", body, StringComparison.Ordinal);
+        Assert.DoesNotContain(TraceparentValue, body, StringComparison.Ordinal);
+        Assert.Equal(TopLevelKeys(plain.Value), TopLevelKeys(traced.Value));
+        Assert.Equal(Urn, EnvelopeCodec.Urn(EnvelopeCodec.Decode(body)));
+
+        // The contract projection is untouched.
+        Assert.Equal(Urn, KafkaHeaders.GetString(traced.Headers, KafkaHeaders.Job));
+        Assert.Equal("trace-1", KafkaHeaders.GetString(traced.Headers, KafkaHeaders.TraceId));
+    }
+
+    [Fact]
+    public async Task PublishWithoutHeadersAddsNoTraceHeaders()
+    {
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var publisher = KafkaPublisher.Create(Producer(captured).Object, "orders");
+
+        await publisher.PublishAsync(Urn, null, "trace-1");
+        await publisher.PublishWithHeadersAsync(Urn, null, new Dictionary<string, string>(), "trace-1");
+        await publisher.PublishWithHeadersAsync(Urn, null, null, "trace-1");
+
+        foreach (var (_, message) in captured)
+        {
+            Assert.Null(KafkaHeaders.GetString(message.Headers, "traceparent"));
+            Assert.Null(KafkaHeaders.GetString(message.Headers, "tracestate"));
+            Assert.Equal(captured[0].Message.Headers.Count, message.Headers.Count);
+        }
+    }
+
+    [Fact]
+    public async Task PublishWithHeadersNeverClobbersAContractHeader()
+    {
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var publisher = KafkaPublisher.Create(Producer(captured).Object, "orders");
+
+        await publisher.PublishWithHeadersAsync(
+            Urn, null, new Dictionary<string, string> { ["bq-job"] = "urn:evil", ["bq-attempts"] = "9", [""] = "x", ["empty"] = "" });
+
+        var headers = captured[0].Message.Headers;
+        Assert.Equal(Urn, KafkaHeaders.GetString(headers, KafkaHeaders.Job));
+        Assert.Equal("0", KafkaHeaders.GetString(headers, KafkaHeaders.Attempts));
+        Assert.Single(headers, h => h.Key == KafkaHeaders.Job);
+        Assert.Null(KafkaHeaders.GetString(headers, "empty"));
+    }
+
+    [Fact]
+    public async Task DelayedPublishWithHeadersCarriesTraceparentOnTheRetryTierRecord()
+    {
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var rt = RetryTopics.ForTopic("orders").Tier(TimeSpan.FromSeconds(60)).Build();
+
+        await KafkaPublisher.Create(Producer(captured).Object, rt)
+            .PublishWithHeadersAsync(Urn, null, TraceHeaders(), null, TimeSpan.FromSeconds(30));
+
+        var (topic, message) = Assert.Single(captured);
+        Assert.Equal("orders.retry.1", topic);
+        Assert.Equal(TraceparentValue, KafkaHeaders.GetString(message.Headers, "traceparent"));
+        Assert.Equal("30000", KafkaHeaders.GetString(message.Headers, KafkaHeaders.Delay));
+        Assert.Equal("orders", KafkaHeaders.GetString(message.Headers, KafkaHeaders.OriginalTopic));
+    }
+
+    [Fact]
+    public async Task ConsumerSpanIsATrueChildOfTheProducerSpanViaTheReceivedHeaders()
+    {
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var publisher = KafkaPublisher.Create(Producer(captured).Object, "orders");
+        var producerTrace = ActivityTraceId.CreateFromString(TraceparentValue.AsSpan(3, 32));
+
+        await publisher.PublishWithHeadersAsync(Urn, null, TraceHeaders(), "trace-1");
+        var consumed = Received("orders", captured[0].Message);
+        var envelope = EnvelopeCodec.Decode(Encoding.UTF8.GetString(consumed.Message.Value));
+
+        Activity? consumerSpan = null;
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == Telemetry.ActivitySourceName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStarted = activity =>
+            {
+                if (activity.Kind == ActivityKind.Consumer && activity.TraceId == producerTrace)
+                {
+                    consumerSpan = activity;
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        await Telemetry.Wrap(_ => Task.CompletedTask, KafkaTraceHeaders.Extract(consumed.Message.Headers))(envelope);
+
+        Assert.NotNull(consumerSpan);
+        Assert.Equal("b7ad6b7169203331", consumerSpan!.ParentSpanId.ToHexString());
+    }
+
+    [Fact]
+    public void ExtractOfNoHeadersIsEmpty()
+    {
+        Assert.Empty(KafkaTraceHeaders.Extract(null));
+        Assert.Empty(KafkaTraceHeaders.Extract(new Headers()));
+    }
+
+    [Fact]
+    public async Task PublishWithHeadersDropsEveryContractHeaderIncludingTheRetryPair()
+    {
+        // Parity with the Go reference: bq-delay / bq-original-topic are owned by the transport and never
+        // accepted from the carrier, even though a plain first publish does not project them (§6.3).
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        var carrier = new Dictionary<string, string> { ["traceparent"] = TraceparentValue };
+        foreach (var key in new[]
+        {
+            KafkaHeaders.Job, KafkaHeaders.TraceId, KafkaHeaders.MessageId, KafkaHeaders.SchemaVersion,
+            KafkaHeaders.SourceLang, KafkaHeaders.Attempts, KafkaHeaders.Delay, KafkaHeaders.OriginalTopic,
+        })
+        {
+            carrier[key] = "evil";
+        }
+
+        await KafkaPublisher.Create(Producer(captured).Object, "orders").PublishWithHeadersAsync(Urn, null, carrier, "trace-1");
+
+        var (topic, message) = Assert.Single(captured);
+        Assert.Equal("orders", topic);
+        Assert.Null(KafkaHeaders.GetString(message.Headers, KafkaHeaders.Delay));
+        Assert.Null(KafkaHeaders.GetString(message.Headers, KafkaHeaders.OriginalTopic));
+        Assert.Equal(Urn, KafkaHeaders.GetString(message.Headers, KafkaHeaders.Job));
+        Assert.Equal("trace-1", KafkaHeaders.GetString(message.Headers, KafkaHeaders.TraceId));
+        Assert.Equal("0", KafkaHeaders.GetString(message.Headers, KafkaHeaders.Attempts));
+        Assert.DoesNotContain(message.Headers, h => System.Text.Encoding.UTF8.GetString(h.GetValueBytes()) == "evil");
+        Assert.Equal(TraceparentValue, KafkaHeaders.GetString(message.Headers, "traceparent"));
+    }
+
+    [Fact]
+    public async Task ExtractLeavesOutTheContractHeaders()
+    {
+        var captured = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        await KafkaPublisher.Create(Producer(captured).Object, "orders").PublishWithHeadersAsync(Urn, null, TraceHeaders(), "trace-1");
+
+        var map = KafkaTraceHeaders.Extract(captured[0].Message.Headers);
+
+        Assert.Equal(new[] { "traceparent", "tracestate" }, new SortedSet<string>(map.Keys, StringComparer.Ordinal));
     }
 }
