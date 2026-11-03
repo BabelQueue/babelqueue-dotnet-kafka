@@ -9,12 +9,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-03
+
 ### Added
 
 - **Dead-letter observer (ADR-0039 section 5.1).** `KafkaConsumerOptions.DeadLetterObserver` takes the core's optional `BabelQueue.IDeadLetterObserver` (needs a `BabelQueue.Core` that ships it). `KafkaConsumer` calls it once per dead-letter the SDK itself carried out: a record written to the DLQ topic, after the broker confirmed the write: an exhausted retry, an unmapped URN under `dead_letter`, a poison body, and a raw record rejected by the schema-version gate (empty `Reason`). `Queue` is `meta.queue` when the envelope carries one, else the topic the record came from; `DeadLetterQueue` is the DLQ topic. It is not called when the write fails, for a retry-tier republish, or when no DLQ is configured. The call goes through `DeadLetterObservers.NotifySafely`, so an observer exception is caught and logged and never changes the settle outcome. Without an observer nothing changes. Envelope unchanged (`schema_version` stays 1).
 - **W3C `traceparent` propagation (ADR-0028).** `KafkaPublisher.PublishWithHeadersAsync(urn, data, headers, traceId, delay)` overlays an out-of-band header carrier (e.g. the one `Telemetry.PublishAsync(..., headers, ...)` fills from the producer span) as UTF-8 record headers, **beside** the frozen envelope and the `bq-` / `bq_` contract projection, never inside the body. The transport-owned `bq-*` headers (including `bq-delay` / `bq-original-topic`) are always dropped from the carrier (parity with the Go reference), keys already present are never overwritten and empty keys/values are skipped; a `null`/empty carrier is identical to `PublishAsync`. A delayed publish carries them on the retry-tier record, so the re-inject loop forwards them to the work topic.
 - `KafkaTraceHeaders.Extract(...)`: surfaces a received message's record headers as a flat map to hand to `Telemetry.Wrap(handler, headers)`, so the consumer span becomes a true child of the producer span. The transport-owned contract keys are left out of the map, so it can be handed back to `PublishWithHeadersAsync` safely. With no `traceparent` the core falls back to the v0.1 `trace_id` mapping. The `BabelHandler` signature is unchanged; call `KafkaTraceHeaders.Extract(result.Message.Headers)` inside the handler.
 - Envelope unchanged (`schema_version` stays 1); additive, no wire change.
+
+### Changed
+
+- `BabelQueue.Core` dependency raised from `1.13.0` to `1.14.0` (`IDeadLetterObserver`).
 
 ## [1.3.0] - 2026-10-24
 
