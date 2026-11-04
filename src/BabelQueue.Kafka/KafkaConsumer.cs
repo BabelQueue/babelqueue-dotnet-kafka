@@ -395,6 +395,7 @@ public sealed class KafkaConsumer
         KafkaHeaders.Add(headers, KafkaHeaders.OriginalTopic, original);
         KafkaHeaders.CarryTrace(headers, result.Message.Headers);
         await ProduceAsync(dlq, result.Message.Key, annotated, headers, cancellationToken).ConfigureAwait(false);
+        NotifyDeadLetter(SourceQueue(envelope, original), dlq, reason);
     }
 
     private async Task SettlePoisonAsync(
@@ -484,6 +485,7 @@ public sealed class KafkaConsumer
             Timestamp = new Timestamp(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), TimestampType.CreateTime),
         };
         await _options.Producer!.ProduceAsync(dlq, message, cancellationToken).ConfigureAwait(false);
+        NotifyDeadLetter(original, dlq, "poison");
     }
 
     private async Task DeadLetterRawAsync(ConsumeResult<byte[], byte[]> result, CancellationToken cancellationToken)
@@ -502,7 +504,20 @@ public sealed class KafkaConsumer
             Timestamp = new Timestamp(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), TimestampType.CreateTime),
         };
         await _options.Producer!.ProduceAsync(dlq, message, cancellationToken).ConfigureAwait(false);
+        // A raw body is never decoded: no meta.queue, and no dead_letter.reason was written.
+        NotifyDeadLetter(OriginalTopic(result), dlq, string.Empty);
     }
+
+    /// <summary>
+    /// Reports a DLQ write the broker just confirmed (ADR-0039 section 5.1). Goes through
+    /// <see cref="DeadLetterObservers.NotifySafely"/>, so an observer failure can never change the settle outcome.
+    /// </summary>
+    private void NotifyDeadLetter(string queue, string deadLetterQueue, string reason)
+        => _options.DeadLetterObserver.NotifySafely(new DeadLetterEvent(queue, deadLetterQueue, reason));
+
+    /// <summary><c>meta.queue</c> when the envelope carries one, else the topic the record was consumed from.</summary>
+    private static string SourceQueue(Envelope envelope, string fallback)
+        => string.IsNullOrWhiteSpace(envelope.Meta?.Queue) ? fallback : envelope.Meta!.Queue!;
 
     // The source record's key is carried unchanged (null stays null, empty stays empty, nothing is synthesised) so a
     // keyed stream keeps its key across retry tiers and the DLQ.

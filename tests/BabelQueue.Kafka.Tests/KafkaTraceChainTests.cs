@@ -186,4 +186,78 @@ public sealed class KafkaTraceChainTests
         Assert.Null(KafkaHeaders.GetString(work.Headers, KafkaHeaders.Delay));
         Assert.Null(KafkaHeaders.GetString(work.Headers, KafkaHeaders.OriginalTopic));
     }
+
+    [Fact]
+    public async Task HandlerReceivesTheOutOfBandTraceHeadersThroughTheConsumer()
+    {
+        var env = NewEnvelope();
+        var consumer = new Mock<IConsumer<byte[], byte[]>>();
+        consumer.Setup(c => c.Consume(It.IsAny<TimeSpan>())).Returns(Source(env));
+        IReadOnlyDictionary<string, string>? seen = null;
+        var handlers = new Dictionary<string, BabelHandler>
+        {
+            [Urn] = (_, result, _) =>
+            {
+                seen = KafkaTraceHeaders.Extract(result.Message.Headers);
+                return Task.CompletedTask;
+            },
+        };
+
+        await new KafkaConsumer(consumer.Object, handlers, new KafkaConsumerOptions
+        {
+            Producer = Producer(new List<(string, Message<byte[], byte[]>)>()).Object,
+            RetryTopics = RetryTopics.ForTopic("orders").Tier(TimeSpan.FromSeconds(5)).Build(),
+            OnError = (_, _, _) => { },
+        }).PollAsync();
+
+        Assert.NotNull(seen);
+        Assert.Equal(Traceparent, seen!["traceparent"]);
+        Assert.Equal(Tracestate, seen["tracestate"]);
+        Assert.DoesNotContain(seen.Keys, KafkaHeaders.IsContract);
+    }
+
+    [Fact]
+    public async Task PublishWithHeadersDelayThenReinjectCarriesTheTraceparentToTheWorkTopic()
+    {
+        var rt = RetryTopics.ForTopic("orders").Tier(TimeSpan.FromSeconds(60)).Build();
+        var sent = new List<(string Topic, Message<byte[], byte[]> Message)>();
+        await KafkaPublisher.Create(Producer(sent).Object, rt).PublishWithHeadersAsync(
+            Urn,
+            new Dictionary<string, object?> { ["order_id"] = 7 },
+            new Dictionary<string, string> { ["traceparent"] = Traceparent, ["tracestate"] = Tracestate },
+            "trace-1",
+            TimeSpan.FromSeconds(30));
+        var (tierTopic, tierMessage) = Assert.Single(sent);
+        Assert.Equal("orders.retry.1", tierTopic);
+
+        var now = new DateTimeOffset(2026, 10, 23, 12, 0, 0, TimeSpan.Zero);
+        var tierRecord = new ConsumeResult<byte[], byte[]>
+        {
+            Topic = tierTopic,
+            Partition = new Partition(0),
+            Offset = new Offset(1),
+            Message = new Message<byte[], byte[]>
+            {
+                Key = tierMessage.Key,
+                Value = tierMessage.Value,
+                Headers = tierMessage.Headers,
+                Timestamp = new Timestamp(now.AddMinutes(-10).UtcDateTime, TimestampType.LogAppendTime),
+            },
+        };
+        var consumer = new Mock<IConsumer<byte[], byte[]>>();
+        consumer.SetupSequence(c => c.Consume(It.IsAny<TimeSpan>())).Returns(tierRecord).Returns((ConsumeResult<byte[], byte[]>)null!);
+        var produced = new List<(string Topic, Message<byte[], byte[]> Message)>();
+
+        Assert.Equal(1, await new KafkaReinjectConsumer(consumer.Object, new KafkaReinjectOptions
+        {
+            Producer = Producer(produced).Object,
+            Clock = () => now,
+            PollTimeout = TimeSpan.FromMilliseconds(10),
+        }).PollAsync());
+
+        var (workTopic, work) = Assert.Single(produced);
+        Assert.Equal("orders", workTopic);
+        Assert.Equal(Traceparent, KafkaHeaders.GetString(work.Headers, "traceparent"));
+        Assert.Equal(Tracestate, KafkaHeaders.GetString(work.Headers, "tracestate"));
+    }
 }
